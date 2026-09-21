@@ -36,6 +36,10 @@ type Conn struct {
 	closed   bool
 	closeErr error
 
+	// whether Engine.wgConn has been Add(1)ed for this connection,
+	// used to balance the Done in the onClose wrapper exactly once.
+	wgConnAdded bool
+
 	ReadBuffer []byte
 
 	// user session.

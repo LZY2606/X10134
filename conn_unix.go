@@ -123,6 +123,10 @@ type Conn struct {
 	typ    ConnType
 	closed bool
 
+	// whether Engine.wgConn has been Add(1)ed for this connection,
+	// used to balance the Done in the onClose wrapper exactly once.
+	wgConnAdded bool
+
 	// whether the writing event has been set in the poller.
 	isWAdded bool
 	// the first closing error.

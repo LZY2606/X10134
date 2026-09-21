@@ -74,12 +74,27 @@ func (p *poller) addConn(c *Conn) error {
 	c.p = p
 	p.g.mux.Lock()
 	p.g.connsStd[c] = struct{}{}
+	shutdown := p.g.shutdown
 	p.g.mux.Unlock()
 	// should not call onOpen for udp server conn
 	if c.typ != ConnTypeUDPServer {
 		p.g.onOpen(c)
 	} else {
 		p.g.onUDPListen(c)
+	}
+	// If the Engine is stopping, or the connection has been closed while
+	// onOpen was running, close it instead of serving it so that its
+	// lifecycle completes exactly once.
+	c.mux.Lock()
+	closed := c.closed
+	c.mux.Unlock()
+	if shutdown || closed {
+		err := errEngineStopped
+		if closed && !shutdown {
+			err = net.ErrClosed
+		}
+		_ = c.CloseWithError(err)
+		return err
 	}
 	// should not read udp client from reading udp server conn
 	if c.typ != ConnTypeUDPClientFromRead {

@@ -21,4 +21,8 @@ var (
 	ErrDialTimeout = errors.New("dial timeout")
 
 	ErrUnsupported = errors.New("unsupported operation")
+
+	// errEngineStopped is used internally to reject or close connections
+	// that finish being accepted after the Engine has begun to stop.
+	errEngineStopped = errors.New("engine stopped")
 )

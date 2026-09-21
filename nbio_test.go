@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-var addr = "127.0.0.1:9999"
+var addr = "127.0.0.1:0"
 var testfile = "test_tmp.file"
 var engine *Engine
 var testFileSize = 1024 * 1024 * 32
@@ -98,6 +98,7 @@ func init() {
 	if err != nil {
 		log.Panicf("Start failed: %v\n", err)
 	}
+	addr = g.Addrs[0]
 
 	engine = g
 }
@@ -320,7 +321,7 @@ func TestUDP(t *testing.T) {
 	}
 	defer g.Stop()
 
-	addrstr := fmt.Sprintf("127.0.0.1:%d", 9999)
+	addrstr := "127.0.0.1:0"
 	addr, err := net.ResolveUDPAddr("udp", addrstr)
 	if err != nil {
 		t.Fatalf("ResolveUDPAddr error: %v", err)
@@ -329,13 +330,14 @@ func TestUDP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen error: %v", err)
 	}
+	udpPort := conn.LocalAddr().(*net.UDPAddr).Port
 
 	lisConn, _ := g.AddConn(conn)
 
 	newClientConn := func() *net.UDPConn {
 		connUDP, errDial := net.DialUDP("udp4", nil, &net.UDPAddr{
 			IP:   net.IPv4(127, 0, 0, 1),
-			Port: 9999,
+			Port: udpPort,
 		})
 		if errDial != nil {
 			t.Fatalf("net.DialUDP failed: %v", err)
@@ -525,10 +527,13 @@ func TestUnix(t *testing.T) {
 	})
 	var connSvr *Conn
 	var connCli *Conn
+	var connMux sync.Mutex
 	g.OnOpen(func(c *Conn) {
+		connMux.Lock()
 		if connSvr == nil {
 			connSvr = c
 		}
+		connMux.Unlock()
 		c.Type()
 		c.IsTCP()
 		c.IsUDP()
@@ -537,13 +542,17 @@ func TestUnix(t *testing.T) {
 	})
 	g.OnData(func(c *Conn, data []byte) {
 		log.Println("unix onData:", c.LocalAddr().String(), c.RemoteAddr().String(), string(data))
-		if c == connSvr {
+		connMux.Lock()
+		isSvr := c == connSvr
+		isCli := c == connCli
+		connMux.Unlock()
+		if isSvr {
 			_, err := c.Write([]byte("world"))
 			if err != nil {
 				t.Fatal(err)
 			}
 		}
-		if c == connCli && string(data) == "world" {
+		if isCli && string(data) == "world" {
 			_ = c.Close()
 		}
 	})
@@ -566,11 +575,14 @@ func TestUnix(t *testing.T) {
 	defer func() { _ = c.Close() }()
 	time.Sleep(time.Second / 10)
 	buf := []byte("hello")
-	connCli, err = g.AddConn(c)
+	cc, err := g.AddConn(c)
 	if err != nil {
 		t.Fatalf("unix AddConn: %v, %v, %v", c.LocalAddr(), c.RemoteAddr(), err)
 	}
-	_, err = connCli.Write(buf)
+	connMux.Lock()
+	connCli = cc
+	connMux.Unlock()
+	_, err = cc.Write(buf)
 	if err != nil {
 		t.Fatalf("unix Write: %v, %v, %v", c.LocalAddr(), c.RemoteAddr(), err)
 	}

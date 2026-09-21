@@ -86,7 +86,28 @@ func (p *poller) addConn(c *Conn) error {
 	} else {
 		p.g.onUDPListen(c)
 	}
-	p.g.connsUnix[fd] = c
+
+	// If the Engine is stopping, or the connection has been closed while
+	// onOpen was running, don't register the connection: close it instead
+	// so that its lifecycle completes exactly once.
+	p.g.mux.Lock()
+	shutdown := p.g.shutdown
+	p.g.mux.Unlock()
+	c.mux.Lock()
+	closed := c.closed
+	if !shutdown && !closed {
+		p.g.connsUnix[fd] = c
+	}
+	c.mux.Unlock()
+	if shutdown || closed {
+		err := errEngineStopped
+		if closed && !shutdown {
+			err = net.ErrClosed
+		}
+		_ = c.closeWithError(err)
+		return err
+	}
+
 	err := p.addRead(fd)
 	if err != nil {
 		p.g.connsUnix[fd] = nil

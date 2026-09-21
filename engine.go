@@ -127,6 +127,11 @@ type Engine struct {
 	Execute func(f func())
 	mux     sync.Mutex
 
+	// shutdown is set when Engine.Stop has begun, guarded by mux.
+	// Connections that finish being accepted after it is set are
+	// closed immediately instead of being registered.
+	shutdown bool
+
 	isOneshot bool
 
 	wgConn sync.WaitGroup
@@ -198,6 +203,14 @@ func (e *Engine) SetLTSyncRead() {
 //
 //go:norace
 func (g *Engine) Stop() {
+	g.mux.Lock()
+	if g.shutdown {
+		g.mux.Unlock()
+		return
+	}
+	g.shutdown = true
+	g.mux.Unlock()
+
 	for _, l := range g.listeners {
 		l.stop()
 	}
@@ -207,6 +220,10 @@ func (g *Engine) Stop() {
 	g.connsStd = map[*Conn]struct{}{}
 	connsUnix := g.connsUnix
 	g.mux.Unlock()
+
+	if testHookBeforeShutdownWait != nil {
+		testHookBeforeShutdownWait()
+	}
 
 	g.wgConn.Done()
 	for c := range conns {
@@ -314,7 +331,12 @@ func (g *Engine) OnOpen(h func(c *Conn)) {
 		panic("invalid handler: nil")
 	}
 	g.onOpen = func(c *Conn) {
-		g.wgConn.Add(1)
+		g.mux.Lock()
+		if !g.shutdown {
+			g.wgConn.Add(1)
+			c.wgConnAdded = true
+		}
+		g.mux.Unlock()
 		h(c)
 	}
 }
@@ -328,7 +350,12 @@ func (g *Engine) OnClose(h func(c *Conn, err error)) {
 	}
 	g.onClose = func(c *Conn, err error) {
 		g.Async(func() {
-			defer g.wgConn.Done()
+			g.mux.Lock()
+			wgAdded := c.wgConnAdded
+			g.mux.Unlock()
+			if wgAdded {
+				defer g.wgConn.Done()
+			}
 			h(c, err)
 		})
 	}
