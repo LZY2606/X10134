@@ -81,15 +81,29 @@ func (p *poller) addConn(c *Conn) error {
 		return err
 	}
 	c.p = p
+	p.g.mux.Lock()
+	if p.g.stopped {
+		p.g.mux.Unlock()
+		_ = c.closeDirectly()
+		return errEngineStopped
+	}
+	p.g.addingConn.Add(1)
+	p.g.connsUnix[fd] = c
+	p.g.mux.Unlock()
+	defer p.g.addingConn.Done()
+
 	if c.typ != ConnTypeUDPServer {
 		p.g.onOpen(c)
 	} else {
 		p.g.onUDPListen(c)
 	}
-	p.g.connsUnix[fd] = c
 	err := p.addRead(fd)
 	if err != nil {
-		p.g.connsUnix[fd] = nil
+		p.g.mux.Lock()
+		if p.g.connsUnix[fd] == c {
+			p.g.connsUnix[fd] = nil
+		}
+		p.g.mux.Unlock()
 		_ = c.closeWithError(err)
 	}
 	return err

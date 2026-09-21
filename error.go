@@ -22,3 +22,5 @@ var (
 
 	ErrUnsupported = errors.New("unsupported operation")
 )
+
+var errEngineStopped = errors.New("engine stopped")

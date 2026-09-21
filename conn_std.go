@@ -310,6 +310,25 @@ func (c *Conn) CloseWithError(err error) error {
 	return c.Close()
 }
 
+// closeDirectly closes the conn without publishing any event.
+// It's used when a conn is rejected before being opened,
+// e.g. the Engine is stopped while the conn is being added.
+//
+//go:norace
+func (c *Conn) closeDirectly() error {
+	switch c.typ {
+	case ConnTypeTCP:
+		if c.conn != nil {
+			return c.conn.Close()
+		}
+	case ConnTypeUDPServer, ConnTypeUDPClientFromDial, ConnTypeUDPClientFromRead:
+		if c.connUDP != nil {
+			return c.connUDP.Close()
+		}
+	}
+	return nil
+}
+
 // LocalAddr wraps net.Conn.LocalAddr.
 //
 //go:norace

@@ -1025,6 +1025,23 @@ func (c *Conn) closeWithErrorWithoutLock(err error) error {
 	return err
 }
 
+// closeDirectly closes the fd without publishing any event.
+// It's used when a conn is rejected before being opened,
+// e.g. the Engine is stopped while the conn is being added.
+//
+//go:norace
+func (c *Conn) closeDirectly() error {
+	switch c.typ {
+	case ConnTypeTCP, ConnTypeUnix:
+		return syscall.Close(c.fd)
+	case ConnTypeUDPServer, ConnTypeUDPClientFromDial, ConnTypeUDPClientFromRead:
+		if c.connUDP != nil {
+			return c.connUDP.Close()
+		}
+	}
+	return nil
+}
+
 // NBConn converts net.Conn to *Conn.
 //
 //go:norace

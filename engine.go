@@ -127,6 +127,13 @@ type Engine struct {
 	Execute func(f func())
 	mux     sync.Mutex
 
+	// stopped is set when Engine.Stop begins, no more conn is
+	// accepted after that.
+	stopped bool
+	// addingConn tracks in-flight addConn calls, so that Engine.Stop
+	// doesn't miss a conn that is being registered.
+	addingConn sync.WaitGroup
+
 	isOneshot bool
 
 	wgConn sync.WaitGroup
@@ -201,6 +208,14 @@ func (g *Engine) Stop() {
 	for _, l := range g.listeners {
 		l.stop()
 	}
+
+	// Reject new conns and wait for in-flight addConn to finish
+	// registering, so that the snapshot below doesn't miss any conn
+	// and wgConn.Wait wouldn't block forever.
+	g.mux.Lock()
+	g.stopped = true
+	g.mux.Unlock()
+	g.addingConn.Wait()
 
 	g.mux.Lock()
 	conns := g.connsStd
