@@ -71,6 +71,10 @@ type poller struct {
 //
 //go:norace
 func (p *poller) addConn(c *Conn) error {
+	p.g.wgAdding.Add(1)
+	defer p.g.wgAdding.Done()
+	testHookAddConnBegin(c)
+
 	fd := c.fd
 	if fd >= len(p.g.connsUnix) {
 		err := fmt.Errorf("too many open files, fd[%d] >= MaxOpenFiles[%d]",
@@ -81,15 +85,27 @@ func (p *poller) addConn(c *Conn) error {
 		return err
 	}
 	c.p = p
+	p.g.mux.Lock()
+	if p.g.isStopping {
+		p.g.mux.Unlock()
+		// Stop is in progress and this connection has never been
+		// published (no OnOpen yet): drop it silently so no user
+		// callback and no wait-group accounting is produced for it.
+		_ = syscall.Close(c.fd)
+		return nil
+	}
+	p.g.connsUnix[fd] = c
+	p.g.mux.Unlock()
 	if c.typ != ConnTypeUDPServer {
 		p.g.onOpen(c)
 	} else {
 		p.g.onUDPListen(c)
 	}
-	p.g.connsUnix[fd] = c
 	err := p.addRead(fd)
 	if err != nil {
+		p.g.mux.Lock()
 		p.g.connsUnix[fd] = nil
+		p.g.mux.Unlock()
 		_ = c.closeWithError(err)
 	}
 	return err
@@ -99,6 +115,9 @@ func (p *poller) addConn(c *Conn) error {
 //
 //go:norace
 func (p *poller) addDialer(c *Conn) error {
+	p.g.wgAdding.Add(1)
+	defer p.g.wgAdding.Done()
+
 	fd := c.fd
 	if fd >= len(p.g.connsUnix) {
 		err := fmt.Errorf("too many open files, fd[%d] >= MaxOpenFiles[%d]",
@@ -109,11 +128,20 @@ func (p *poller) addDialer(c *Conn) error {
 		return err
 	}
 	c.p = p
+	p.g.mux.Lock()
+	if p.g.isStopping {
+		p.g.mux.Unlock()
+		_ = syscall.Close(fd)
+		return net.ErrClosed
+	}
 	p.g.connsUnix[fd] = c
+	p.g.mux.Unlock()
 	c.isWAdded = true
 	err := p.addReadWrite(fd)
 	if err != nil {
+		p.g.mux.Lock()
 		p.g.connsUnix[fd] = nil
+		p.g.mux.Unlock()
 		_ = c.closeWithError(err)
 	}
 	return err
@@ -131,12 +159,14 @@ func (p *poller) deleteConn(c *Conn) {
 	}
 	fd := c.fd
 
+	p.g.mux.Lock()
 	if c.typ != ConnTypeUDPClientFromRead {
 		if c == p.g.connsUnix[fd] {
 			p.g.connsUnix[fd] = nil
 		}
 		// p.deleteEvent(fd)
 	}
+	p.g.mux.Unlock()
 
 	if c.typ != ConnTypeUDPServer {
 		p.g.onClose(c, c.closeErr)
@@ -178,6 +208,7 @@ func (p *poller) acceptorLoop() {
 				_ = conn.Close()
 				continue
 			}
+			testHookAcceptConn(c)
 			err = p.g.pollers[c.Hash()%len(p.g.pollers)].addConn(c)
 			if err != nil {
 				logging.Error("NBIO[%v][%v_%v] addConn [fd: %v] failed: %v",

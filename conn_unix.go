@@ -792,6 +792,8 @@ func (c *Conn) writev(in [][]byte) (int, error) {
 //
 //go:norace
 func (c *Conn) flush() error {
+	testHookConnFlush(c)
+
 	c.mux.Lock()
 	defer c.mux.Unlock()
 	if c.closed {
@@ -887,13 +889,16 @@ func (c *Conn) flush() error {
 		buf := (*head.buf)[head.offset:]
 		n, err := syscall.Write(c.fd, buf)
 		if n > 0 {
+			testHookConnFlushed(c, buf, n)
 			if c.p.g.onWrittenSize != nil {
 				c.p.g.onWrittenSize(c, buf[:n], n)
 			}
 			c.left -= n
 			head.offset += int64(n)
 			if len(buf) == n {
+				written := buf
 				c.releaseToWrite(head)
+				testHookWriteBufReleased(c, written)
 				c.writeList[0] = nil
 				c.writeList = c.writeList[1:]
 			}

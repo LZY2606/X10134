@@ -129,6 +129,15 @@ type Engine struct {
 
 	isOneshot bool
 
+	// isStopping is set under mux by Stop; once set, addConn must reject
+	// or take ownership of in-flight accepted connections so that Stop
+	// never misses a connection or reuses wgConn after it has balanced.
+	isStopping bool
+
+	// wgAdding tracks poller addConn/addDialer registrations in flight,
+	// Stop waits for them before snapshotting the connection tables.
+	wgAdding sync.WaitGroup
+
 	wgConn sync.WaitGroup
 
 	// store std connections, for Windows only.
@@ -198,9 +207,25 @@ func (e *Engine) SetLTSyncRead() {
 //
 //go:norace
 func (g *Engine) Stop() {
+	g.mux.Lock()
+	if g.isStopping {
+		g.mux.Unlock()
+		return
+	}
+	g.isStopping = true
+	g.mux.Unlock()
+
 	for _, l := range g.listeners {
 		l.stop()
 	}
+
+	testHookStopListeners()
+
+	// Wait for any connection whose addConn started before (or raced with)
+	// the listener shutdown to reach its publish/drop decision under mux,
+	// so the snapshots below can't miss a connection that arrives after
+	// the tables are copied.
+	g.wgAdding.Wait()
 
 	g.mux.Lock()
 	conns := g.connsStd

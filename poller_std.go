@@ -50,6 +50,7 @@ func (p *poller) accept() error {
 	}
 
 	c := newConn(conn)
+	testHookAcceptConn(c)
 	o := p.g.pollers[c.Hash()%len(p.g.pollers)]
 	o.addConn(c)
 
@@ -71,8 +72,24 @@ func (p *poller) readConn(c *Conn) {
 
 //go:norace
 func (p *poller) addConn(c *Conn) error {
+	p.g.wgAdding.Add(1)
+	defer p.g.wgAdding.Done()
+	testHookAddConnBegin(c)
+
 	c.p = p
 	p.g.mux.Lock()
+	if p.g.isStopping {
+		p.g.mux.Unlock()
+		// Stop is in progress and this connection has never been
+		// published (no OnOpen yet): drop it silently so no user
+		// callback and no wait-group accounting is produced for it.
+		if c.typ == ConnTypeTCP {
+			_ = c.conn.Close()
+		} else if c.connUDP != nil {
+			_ = c.connUDP.Close()
+		}
+		return nil
+	}
 	p.g.connsStd[c] = struct{}{}
 	p.g.mux.Unlock()
 	// should not call onOpen for udp server conn
@@ -91,8 +108,15 @@ func (p *poller) addConn(c *Conn) error {
 
 //go:norace
 func (p *poller) addDialer(c *Conn) error {
+	p.g.wgAdding.Add(1)
+	defer p.g.wgAdding.Done()
+
 	c.p = p
 	p.g.mux.Lock()
+	if p.g.isStopping {
+		p.g.mux.Unlock()
+		return net.ErrClosed
+	}
 	p.g.connsStd[c] = struct{}{}
 	p.g.mux.Unlock()
 	go p.readConn(c)
