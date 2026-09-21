@@ -51,6 +51,9 @@ func (p *poller) accept() error {
 
 	c := newConn(conn)
 	o := p.g.pollers[c.Hash()%len(p.g.pollers)]
+	if testHookAfterAccepted != nil {
+		testHookAfterAccepted(c)
+	}
 	o.addConn(c)
 
 	return nil

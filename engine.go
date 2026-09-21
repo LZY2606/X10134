@@ -129,6 +129,10 @@ type Engine struct {
 
 	isOneshot bool
 
+	// tracks listener goroutines, used by Stop to guarantee no accept is in
+	// flight before live connections are snapshotted for shutdown.
+	wgListener sync.WaitGroup
+
 	wgConn sync.WaitGroup
 
 	// store std connections, for Windows only.
@@ -201,6 +205,13 @@ func (g *Engine) Stop() {
 	for _, l := range g.listeners {
 		l.stop()
 	}
+	if testHookAfterListenersClosed != nil {
+		testHookAfterListenersClosed()
+	}
+	// Wait for listener goroutines to leave Accept before snapshotting the
+	// connection tables: otherwise a connection accepted in this window gets
+	// onOpen/wgConn.Add but is missed by the close loop and leaks its fd.
+	g.wgListener.Wait()
 
 	g.mux.Lock()
 	conns := g.connsStd
@@ -208,7 +219,6 @@ func (g *Engine) Stop() {
 	connsUnix := g.connsUnix
 	g.mux.Unlock()
 
-	g.wgConn.Done()
 	for c := range conns {
 		if c != nil {
 			cc := c
@@ -459,7 +469,6 @@ func (g *Engine) PollerBufferPtr(c *Conn) *[]byte {
 
 //go:norace
 func (g *Engine) initHandlers() {
-	g.wgConn.Add(1)
 	g.OnOpen(func(c *Conn) {})
 	g.OnClose(func(c *Conn, err error) {})
 	// g.OnRead(func(c *Conn, b []byte) ([]byte, error) {

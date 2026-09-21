@@ -38,13 +38,23 @@ const (
 	TCP_KEEPIDLE  = 0
 )
 
+// wakeupToken is written to the IO poller wakeup socketpair to unblock its
+// Kevent wait so it can pick up newly registered changes.
+var wakeupToken = []byte{1}
+
 type poller struct {
 	mux sync.Mutex
 
 	g *Engine
 
-	kfd   int
-	evtfd int
+	kfd    int
+	evtfd  int
+	wakefd int
+	// stopfd is the read end of a dedicated shutdown socketpair. It is never
+	// read, so once stop() writes a byte it stays permanently readable and the
+	// IO loop exits regardless of scheduling.
+	stopfd int
+	stopw  int
 
 	index int
 
@@ -126,7 +136,11 @@ func (p *poller) deleteConn(c *Conn) {
 
 //go:norace
 func (p *poller) trigger() error {
-	_, err := syscall.Kevent(p.kfd, []syscall.Kevent_t{{Ident: 0, Filter: syscall.EVFILT_USER, Fflags: syscall.NOTE_TRIGGER}}, nil, nil)
+	_, err := syscall.Write(p.evtfd, wakeupToken)
+	if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+		// Pipe already holds pending tokens; the wakeup is still pending.
+		return nil
+	}
 	return err
 }
 
@@ -249,7 +263,13 @@ func (p *poller) start() {
 	if p.isListener {
 		p.acceptorLoop()
 	} else {
-		defer func() { _ = syscall.Close(p.kfd) }()
+		defer func() {
+			_ = syscall.Close(p.kfd)
+			_ = syscall.Close(p.evtfd)
+			_ = syscall.Close(p.wakefd)
+			_ = syscall.Close(p.stopfd)
+			_ = syscall.Close(p.stopw)
+		}()
 		p.readWriteLoop()
 	}
 }
@@ -270,6 +290,9 @@ func (p *poller) acceptorLoop() {
 			if err != nil {
 				_ = conn.Close()
 				continue
+			}
+			if testHookAfterAccepted != nil {
+				testHookAfterAccepted(c)
 			}
 			_ = p.g.pollers[c.Hash()%len(p.g.pollers)].addConn(c)
 		} else {
@@ -300,20 +323,38 @@ func (p *poller) readWriteLoop() {
 	var changes []syscall.Kevent_t
 
 	p.shutdown = false
+	drainBuf := make([]byte, 256)
 	for !p.shutdown {
 		p.mux.Lock()
 		changes = p.eventList
 		p.eventList = nil
 		p.mux.Unlock()
+
+		// Indefinite wait: shutdown is delivered as data on the wakeup
+		// socketpair (shutdownToken), which cannot be lost across scheduling.
 		n, err := syscall.Kevent(p.kfd, changes, events, nil)
 		if err != nil && !errors.Is(err, syscall.EINTR) && !errors.Is(err, syscall.EBADF) && !errors.Is(err, syscall.ENOENT) && !errors.Is(err, syscall.EINVAL) {
 			logging.Error("NBIO[%v][%v_%v] Kevent failed: %v, exit...", p.g.Name, p.pollType, p.index, err)
+			p.shutdown = true
 			return
 		}
 
 		for i := 0; i < n; i++ {
+			if int(events[i].Ident) == p.stopfd || int(events[i].Ident) == p.wakefd {
+				logging.Error("DBG[%v] event ident=%v stopfd=%v wakefd=%v flags=%v", p.index, events[i].Ident, p.stopfd, p.wakefd, events[i].Flags)
+			}
 			switch int(events[i].Ident) {
-			case p.evtfd:
+			case p.stopfd:
+				// Dedicated shutdown signal: never drained, stays readable.
+				p.shutdown = true
+			case p.wakefd:
+				// Drain ordinary wakeup tokens so the level resets.
+				for {
+					rn, rerr := syscall.Read(p.wakefd, drainBuf)
+					if rerr != nil || rn == 0 {
+						break
+					}
+				}
 			default:
 				p.readWrite(&events[i])
 			}
@@ -324,14 +365,21 @@ func (p *poller) readWriteLoop() {
 //go:norace
 func (p *poller) stop() {
 	logging.Debug("NBIO[%v][%v_%v] stop...", p.g.Name, p.pollType, p.index)
-	p.shutdown = true
 	if p.listener != nil {
+		p.shutdown = true
 		_ = p.listener.Close()
 		if p.unixSockAddr != "" {
 			_ = os.Remove(p.unixSockAddr)
 		}
+		return
 	}
-	p.trigger()
+	p.shutdown = true
+	// Signal shutdown through the dedicated (never-drained) pipe. One byte
+	// makes its read end permanently readable, waking a parked Kevent or
+	// being reported immediately on the next wait; EAGAIN just means it is
+	// already readable from a previous call.
+	nw, werr := syscall.Write(p.stopw, wakeupToken)
+	logging.Error("DBG stop[%v] wrote n=%v err=%v stopw=%v stopfd=%v", p.index, nw, werr, p.stopw, p.stopfd)
 }
 
 //go:norace
@@ -366,20 +414,90 @@ func newPoller(g *Engine, isListener bool, index int) (*poller, error) {
 		return nil, err
 	}
 
-	_, err = syscall.Kevent(fd, []syscall.Kevent_t{{
-		Ident:  0,
-		Filter: syscall.EVFILT_USER,
-		Flags:  syscall.EV_ADD | syscall.EV_CLEAR,
-	}}, nil, nil)
-
+	// Level-triggered wakeup socketpair (read end registered with kqueue),
+	// mirroring the eventfd used on linux. Unlike EVFILT_USER, a token written
+	// before the loop parks is never coalesced away by a concurrent Kevent
+	// changelist call.
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
 	if err != nil {
 		_ = syscall.Close(fd)
+		return nil, err
+	}
+	rfd, wfd := fds[0], fds[1]
+	if err := syscall.SetNonblock(rfd, true); err != nil {
+		_ = syscall.Close(fd)
+		_ = syscall.Close(rfd)
+		_ = syscall.Close(wfd)
+		return nil, err
+	}
+	if err := syscall.SetNonblock(wfd, true); err != nil {
+		_ = syscall.Close(fd)
+		_ = syscall.Close(rfd)
+		_ = syscall.Close(wfd)
+		return nil, err
+	}
+
+	_, err = syscall.Kevent(fd, []syscall.Kevent_t{{
+		Ident:  uint64(rfd),
+		Filter: syscall.EVFILT_READ,
+		Flags:  syscall.EV_ADD,
+	}}, nil, nil)
+	if err != nil {
+		_ = syscall.Close(fd)
+		_ = syscall.Close(rfd)
+		_ = syscall.Close(wfd)
+		return nil, err
+	}
+
+	// Dedicated shutdown pipe: distinct from the ordinary wakeup pipe so a
+	// shutdown signal can never be consumed/drained together with normal
+	// change-list wakeups.
+	sfds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		_ = syscall.Close(fd)
+		_ = syscall.Close(rfd)
+		_ = syscall.Close(wfd)
+		return nil, err
+	}
+	srfd, swfd := sfds[0], sfds[1]
+	cleanupStop := func() {
+		_ = syscall.Close(srfd)
+		_ = syscall.Close(swfd)
+	}
+	if err := syscall.SetNonblock(srfd, true); err != nil {
+		_ = syscall.Close(fd)
+		_ = syscall.Close(rfd)
+		_ = syscall.Close(wfd)
+		cleanupStop()
+		return nil, err
+	}
+	if err := syscall.SetNonblock(swfd, true); err != nil {
+		_ = syscall.Close(fd)
+		_ = syscall.Close(rfd)
+		_ = syscall.Close(wfd)
+		cleanupStop()
+		return nil, err
+	}
+	_, err = syscall.Kevent(fd, []syscall.Kevent_t{{
+		Ident:  uint64(srfd),
+		Filter: syscall.EVFILT_READ,
+		Flags:  syscall.EV_ADD,
+	}}, nil, nil)
+	if err != nil {
+		_ = syscall.Close(fd)
+		_ = syscall.Close(rfd)
+		_ = syscall.Close(wfd)
+		cleanupStop()
 		return nil, err
 	}
 
 	p := &poller{
 		g:          g,
 		kfd:        fd,
+		evtfd:      wfd,
+		wakefd:     rfd,
+		stopfd:     srfd,
+		stopw:      swfd,
 		index:      index,
 		isListener: isListener,
 		pollType:   "POLLER",
