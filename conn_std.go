@@ -138,7 +138,13 @@ func (c *Conn) readUDP(b []byte) (int, error) {
 		}
 		if !ok {
 			p := g.pollers[c.Hash()%len(g.pollers)]
-			p.addConn(uc)
+			if !g.beginConnTracked(p, uc) {
+				return nread, nil
+			}
+			g.onOpen(uc)
+			if uc.typ != ConnTypeUDPClientFromRead {
+				go p.readConn(uc)
+			}
 		}
 		dstConn = uc
 	}

@@ -151,6 +151,15 @@ func (engine *Engine) DialAsync(network, addr string, onConnected func(*Conn, er
 	return engine.DialAsyncTimeout(network, addr, 0, onConnected)
 }
 
+// publishConn publishes a *nix conn in the engine conn table.
+//
+//go:norace
+func (g *Engine) publishConn(c *Conn) {
+	if c.fd < len(g.connsUnix) {
+		g.connsUnix[c.fd] = c
+	}
+}
+
 // DialAsync connects asynchrony to the address on the named network with timeout.
 //
 //go:norace
@@ -241,10 +250,8 @@ func (engine *Engine) DialAsyncTimeout(network, addr string, timeout time.Durati
 		}
 	}
 
-	engine.wgConn.Add(1)
 	_, err = engine.addDialer(c)
 	if err != nil {
-		engine.wgConn.Done()
 		return err
 	}
 

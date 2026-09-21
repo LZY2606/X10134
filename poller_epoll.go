@@ -80,19 +80,22 @@ func (p *poller) addConn(c *Conn) error {
 		_ = c.closeWithError(err)
 		return err
 	}
-	c.p = p
 	if c.typ != ConnTypeUDPServer {
+		// Publish and account the conn before the user callback, so a
+		// Close issued from inside/alongside onOpen (or an accept racing
+		// with Stop) stays balanced.
+		if !p.g.beginConn(p, c) {
+			return nil
+		}
 		p.g.onOpen(c)
+		if c.closed {
+			return nil
+		}
 	} else {
+		p.g.connsUnix[fd] = c
 		p.g.onUDPListen(c)
 	}
-	p.g.connsUnix[fd] = c
-	err := p.addRead(fd)
-	if err != nil {
-		p.g.connsUnix[fd] = nil
-		_ = c.closeWithError(err)
-	}
-	return err
+	return p.addRead(fd)
 }
 
 // add the connection to poller and handle its io events.
@@ -108,8 +111,9 @@ func (p *poller) addDialer(c *Conn) error {
 		_ = c.closeWithError(err)
 		return err
 	}
-	c.p = p
-	p.g.connsUnix[fd] = c
+	if !p.g.beginConn(p, c) {
+		return net.ErrClosed
+	}
 	c.isWAdded = true
 	err := p.addReadWrite(fd)
 	if err != nil {

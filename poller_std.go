@@ -71,15 +71,21 @@ func (p *poller) readConn(c *Conn) {
 
 //go:norace
 func (p *poller) addConn(c *Conn) error {
-	c.p = p
-	p.g.mux.Lock()
-	p.g.connsStd[c] = struct{}{}
-	p.g.mux.Unlock()
 	// should not call onOpen for udp server conn
-	if c.typ != ConnTypeUDPServer {
-		p.g.onOpen(c)
-	} else {
+	if c.typ == ConnTypeUDPServer {
+		p.g.beginConn(p, c)
 		p.g.onUDPListen(c)
+	} else {
+		// Publish and account the conn before the user callback, so a
+		// Close issued from inside/alongside onOpen (or an accept racing
+		// with Stop) stays balanced.
+		if !p.g.beginConn(p, c) {
+			return nil
+		}
+		p.g.onOpen(c)
+		if c.closed {
+			return nil
+		}
 	}
 	// should not read udp client from reading udp server conn
 	if c.typ != ConnTypeUDPClientFromRead {
@@ -91,19 +97,18 @@ func (p *poller) addConn(c *Conn) error {
 
 //go:norace
 func (p *poller) addDialer(c *Conn) error {
-	c.p = p
-	p.g.mux.Lock()
-	p.g.connsStd[c] = struct{}{}
-	p.g.mux.Unlock()
+	if !p.g.beginConn(p, c) {
+		return net.ErrClosed
+	}
 	go p.readConn(c)
 	return nil
 }
 
 //go:norace
 func (p *poller) deleteConn(c *Conn) {
-	p.g.mux.Lock()
+	p.g.connMux.Lock()
 	delete(p.g.connsStd, c)
-	p.g.mux.Unlock()
+	p.g.connMux.Unlock()
 	// should not call onClose for udp server conn
 	if c.typ != ConnTypeUDPServer {
 		p.g.onClose(c, c.closeErr)

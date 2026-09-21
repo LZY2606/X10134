@@ -129,6 +129,14 @@ type Engine struct {
 
 	isOneshot bool
 
+	// stopping is set under connMux when Stop begins. beginConn uses it
+	// to reject connections that would otherwise be registered after
+	// Stop's conn snapshot and never reach zero on wgConn.
+	stopping bool
+	// connMux guards stopping and the conn tables (connsUnix/connsStd)
+	// that are published by accept/addDialer and snapshotted by Stop.
+	connMux sync.RWMutex
+
 	wgConn sync.WaitGroup
 
 	// store std connections, for Windows only.
@@ -202,11 +210,16 @@ func (g *Engine) Stop() {
 		l.stop()
 	}
 
-	g.mux.Lock()
+	// No new connection may be registered after this section: beginConn
+	// checks the same flag under the same lock. Snapshotting and marking
+	// ourselves as stopping is one atomic step, so every conn tracked by
+	// wgConn is either in the snapshot and closed below, or was rejected.
+	g.connMux.Lock()
+	g.stopping = true
 	conns := g.connsStd
 	g.connsStd = map[*Conn]struct{}{}
 	connsUnix := g.connsUnix
-	g.mux.Unlock()
+	g.connMux.Unlock()
 
 	g.wgConn.Done()
 	for c := range conns {
@@ -313,10 +326,47 @@ func (g *Engine) OnOpen(h func(c *Conn)) {
 	if h == nil {
 		panic("invalid handler: nil")
 	}
-	g.onOpen = func(c *Conn) {
-		g.wgConn.Add(1)
-		h(c)
+	// The user handler is stored as-is. wgConn accounting is done by
+	// beginConn at registration time, atomically with publishing the
+	// conn in the poller's table, so Stop can never miss a connection.
+	g.onOpen = h
+}
+
+// beginConn registers a conn with the engine's lifecycle tracking and
+// publishes it in the poller table under the same lock. It returns false
+// when Stop has already snapshotted the tables; in that case the conn is
+// not tracked and the caller must not invoke onOpen/onClose for it.
+//
+//go:norace
+func (g *Engine) beginConn(p *poller, c *Conn) bool {
+	g.connMux.Lock()
+	if g.stopping {
+		g.connMux.Unlock()
+		return false
 	}
+	c.p = p
+	g.publishConn(c)
+	g.wgConn.Add(1)
+	g.connMux.Unlock()
+	return true
+}
+
+// beginConnTracked is like beginConn for conns that are not stored in the
+// engine conn table themselves (UDP children created while reading a UDP
+// server fd share the parent fd). They are closed transitively when the
+// parent conn is closed.
+//
+//go:norace
+func (g *Engine) beginConnTracked(p *poller, c *Conn) bool {
+	g.connMux.Lock()
+	if g.stopping {
+		g.connMux.Unlock()
+		return false
+	}
+	c.p = p
+	g.wgConn.Add(1)
+	g.connMux.Unlock()
+	return true
 }
 
 // OnClose registers callback for disconnected.

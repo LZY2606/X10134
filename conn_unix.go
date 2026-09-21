@@ -330,6 +330,9 @@ func (c *Conn) readUDP(b []byte) (*Conn, int, error) {
 			_ = uc.SetReadDeadline(time.Now().Add(g.UDPReadTimeout))
 		}
 		if !ok {
+			if !g.beginConnTracked(c.p, uc) {
+				return c, 0, syscall.EAGAIN
+			}
 			g.onOpen(uc)
 		}
 		dstConn = uc
