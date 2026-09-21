@@ -123,6 +123,9 @@ type Conn struct {
 	typ    ConnType
 	closed bool
 
+	// wgTracked reports whether the conn is counted in g.wgConn.
+	wgTracked bool
+
 	// whether the writing event has been set in the poller.
 	isWAdded bool
 	// the first closing error.
@@ -330,7 +333,12 @@ func (c *Conn) readUDP(b []byte) (*Conn, int, error) {
 			_ = uc.SetReadDeadline(time.Now().Add(g.UDPReadTimeout))
 		}
 		if !ok {
-			g.onOpen(uc)
+			g.mux.Lock()
+			accepted := g.connOpenedLocked(uc)
+			g.mux.Unlock()
+			if accepted {
+				g.onOpen(uc)
+			}
 		}
 		dstConn = uc
 	}
@@ -348,10 +356,18 @@ func (c *Conn) readUDP(b []byte) (*Conn, int, error) {
 func (c *Conn) Write(b []byte) (int, error) {
 	// c.p.g.beforeWrite(c)
 
+	if testHookWriteEnter != nil {
+		testHookWriteEnter()
+	}
+
 	c.mux.Lock()
 	if c.closed {
 		c.mux.Unlock()
 		return -1, net.ErrClosed
+	}
+
+	if testHookWriteLocked != nil {
+		testHookWriteLocked()
 	}
 
 	n, err := c.write(b)
@@ -386,11 +402,19 @@ func (c *Conn) Write(b []byte) (int, error) {
 func (c *Conn) Writev(in [][]byte) (int, error) {
 	// c.p.g.beforeWrite(c)
 
+	if testHookWriteEnter != nil {
+		testHookWriteEnter()
+	}
+
 	c.mux.Lock()
 	if c.closed {
 		c.mux.Unlock()
 
 		return 0, net.ErrClosed
+	}
+
+	if testHookWriteLocked != nil {
+		testHookWriteLocked()
 	}
 
 	var n int
@@ -890,9 +914,15 @@ func (c *Conn) flush() error {
 			if c.p.g.onWrittenSize != nil {
 				c.p.g.onWrittenSize(c, buf[:n], n)
 			}
+			if testHookFlushWritten != nil {
+				testHookFlushWritten(c)
+			}
 			c.left -= n
 			head.offset += int64(n)
 			if len(buf) == n {
+				if testHookReleaseWrite != nil {
+					testHookReleaseWrite(c)
+				}
 				c.releaseToWrite(head)
 				c.writeList[0] = nil
 				c.writeList = c.writeList[1:]
@@ -1002,6 +1032,9 @@ func (c *Conn) closeWithError(err error) error {
 //go:norace
 func (c *Conn) closeWithErrorWithoutLock(err error) error {
 	c.closeErr = err
+	if c.p != nil {
+		c.p.g.connClosedDone(c)
+	}
 
 	if c.writeList != nil {
 		for _, t := range c.writeList {

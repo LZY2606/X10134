@@ -25,10 +25,28 @@ func init() {
 		log.Panicf("write file failed: %v", err)
 	}
 
+	// Bind the echo engine to a free loopback port up front and hand the
+	// reserved listener to the engine, so tests never collide on a fixed
+	// port (and work even when 9999 is occupied on the build machine).
+	engineLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		log.Panicf("listen failed: %v", err)
+	}
+	addr = engineLn.Addr().String()
+	consumed := false
+	listen := func(network, address string) (net.Listener, error) {
+		if !consumed && address == addr {
+			consumed = true
+			return engineLn, nil
+		}
+		return net.Listen(network, address)
+	}
+
 	addrs := []string{addr}
 	g := NewEngine(Config{
 		Network: "tcp",
 		Addrs:   addrs,
+		Listen:  listen,
 	})
 
 	type writtenSizeSession struct {
@@ -94,7 +112,7 @@ func init() {
 		}
 	})
 
-	err := g.Start()
+	err = g.Start()
 	if err != nil {
 		log.Panicf("Start failed: %v\n", err)
 	}
@@ -320,22 +338,19 @@ func TestUDP(t *testing.T) {
 	}
 	defer g.Stop()
 
-	addrstr := fmt.Sprintf("127.0.0.1:%d", 9999)
-	addr, err := net.ResolveUDPAddr("udp", addrstr)
+	udpLn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
 	if err != nil {
-		t.Fatalf("ResolveUDPAddr error: %v", err)
+		t.Fatalf("listen udp error: %v", err)
 	}
-	conn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		t.Fatalf("listen error: %v", err)
-	}
+	udpPort := udpLn.LocalAddr().(*net.UDPAddr).Port
+	conn := udpLn
 
 	lisConn, _ := g.AddConn(conn)
 
 	newClientConn := func() *net.UDPConn {
 		connUDP, errDial := net.DialUDP("udp4", nil, &net.UDPAddr{
 			IP:   net.IPv4(127, 0, 0, 1),
-			Port: 9999,
+			Port: udpPort,
 		})
 		if errDial != nil {
 			t.Fatalf("net.DialUDP failed: %v", err)
@@ -523,12 +538,17 @@ func TestUnix(t *testing.T) {
 		Network: "unix",
 		Addrs:   []string{unixAddr},
 	})
-	var connSvr *Conn
-	var connCli *Conn
+	var (
+		unixMux sync.Mutex
+		connSvr *Conn
+		connCli *Conn
+	)
 	g.OnOpen(func(c *Conn) {
+		unixMux.Lock()
 		if connSvr == nil {
 			connSvr = c
 		}
+		unixMux.Unlock()
 		c.Type()
 		c.IsTCP()
 		c.IsUDP()
@@ -537,13 +557,17 @@ func TestUnix(t *testing.T) {
 	})
 	g.OnData(func(c *Conn, data []byte) {
 		log.Println("unix onData:", c.LocalAddr().String(), c.RemoteAddr().String(), string(data))
-		if c == connSvr {
+		unixMux.Lock()
+		svr := connSvr
+		cli := connCli
+		unixMux.Unlock()
+		if c == svr {
 			_, err := c.Write([]byte("world"))
 			if err != nil {
 				t.Fatal(err)
 			}
 		}
-		if c == connCli && string(data) == "world" {
+		if c == cli && string(data) == "world" {
 			_ = c.Close()
 		}
 	})
@@ -566,11 +590,14 @@ func TestUnix(t *testing.T) {
 	defer func() { _ = c.Close() }()
 	time.Sleep(time.Second / 10)
 	buf := []byte("hello")
-	connCli, err = g.AddConn(c)
+	addedCli, err := g.AddConn(c)
 	if err != nil {
 		t.Fatalf("unix AddConn: %v, %v, %v", c.LocalAddr(), c.RemoteAddr(), err)
 	}
-	_, err = connCli.Write(buf)
+	unixMux.Lock()
+	connCli = addedCli
+	unixMux.Unlock()
+	_, err = addedCli.Write(buf)
 	if err != nil {
 		t.Fatalf("unix Write: %v, %v, %v", c.LocalAddr(), c.RemoteAddr(), err)
 	}

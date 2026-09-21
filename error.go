@@ -21,4 +21,6 @@ var (
 	ErrDialTimeout = errors.New("dial timeout")
 
 	ErrUnsupported = errors.New("unsupported operation")
+
+	errEngineClosing = errors.New("engine is closing")
 )

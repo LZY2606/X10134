@@ -35,6 +35,7 @@ func TestListenerMux(t *testing.T) {
 	chC := make(chan net.Conn, totalConn)
 	chD := make(chan net.Conn, totalConn)
 	chErr := make(chan error, totalConn)
+	var connsMux sync.Mutex
 	conns := make([]net.Conn, totalConn)[:0]
 
 	accept := func(ln net.Listener, chConn chan net.Conn) {
@@ -62,12 +63,17 @@ func TestListenerMux(t *testing.T) {
 					chErr <- err
 					break
 				}
+				connsMux.Lock()
 				conns = append(conns, conn)
+				connsMux.Unlock()
 			}
 		}()
 	}
 	closeConns := func() {
-		for _, v := range conns {
+		connsMux.Lock()
+		closed := append([]net.Conn(nil), conns...)
+		connsMux.Unlock()
+		for _, v := range closed {
 			_ = v.Close()
 		}
 	}

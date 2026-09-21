@@ -241,10 +241,8 @@ func (engine *Engine) DialAsyncTimeout(network, addr string, timeout time.Durati
 		}
 	}
 
-	engine.wgConn.Add(1)
 	_, err = engine.addDialer(c)
 	if err != nil {
-		engine.wgConn.Done()
 		return err
 	}
 

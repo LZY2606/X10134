@@ -36,6 +36,9 @@ type Conn struct {
 	closed   bool
 	closeErr error
 
+	// wgTracked reports whether the conn is counted in g.wgConn.
+	wgTracked bool
+
 	ReadBuffer []byte
 
 	// user session.
@@ -164,6 +167,13 @@ func (c *Conn) readUDP(b []byte) (int, error) {
 //
 //go:norace
 func (c *Conn) Write(b []byte) (int, error) {
+	if testHookWriteEnter != nil {
+		testHookWriteEnter()
+	}
+	if testHookWriteLocked != nil {
+		testHookWriteLocked()
+	}
+
 	var n int
 	var err error
 	switch c.typ {
@@ -280,6 +290,9 @@ func (c *Conn) Close() error {
 		if c.rTimer != nil {
 			c.rTimer.Stop()
 			c.rTimer = nil
+		}
+		if c.p != nil {
+			c.p.g.connClosedDone(c)
 		}
 
 		switch c.typ {

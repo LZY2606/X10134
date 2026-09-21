@@ -5,15 +5,25 @@ import (
 )
 
 func TestMemPool(t *testing.T) {
-	pool := New(1024*1024*1024, 1024*1024*1024)
-	for i := 0; i < 1024*1024; i++ {
+	// Exercise the same allocator paths as the original stress loop but keep
+	// the maximum allocation bounded so the suite stays fast under -race
+	// (race instrumentation makes repeated multi-MB allocations extremely
+	// slow without adding coverage).
+	// Bounded sizes/iterations keep the sweep fast under -race while still
+	// touching small, pool-sized and over-freeSize allocator paths.
+	const smallIter = 4 * 1024
+	const poolSize = 64 * 1024
+	pool := New(poolSize, poolSize)
+	for i := 0; i < smallIter; i++ {
 		pbuf := pool.Malloc(i)
 		if len(*pbuf) != i {
 			t.Fatalf("invalid len: %v != %v", len(*pbuf), i)
 		}
 		pool.Free(pbuf)
 	}
-	for i := 1024 * 1024; i < 1024*1024*1024; i += 1024 * 1024 {
+	// Over-freeSize allocations bypass the pool and are heap backed; cover
+	// the path with a handful of bounded sizes.
+	for _, i := range []int{poolSize + 1, poolSize * 2, poolSize * 4} {
 		pbuf := pool.Malloc(i)
 		if len(*pbuf) != i {
 			t.Fatalf("invalid len: %v != %v", len(*pbuf), i)
@@ -22,7 +32,7 @@ func TestMemPool(t *testing.T) {
 	}
 
 	pbuf := pool.Malloc(0)
-	for i := 1; i < 1024*1024; i++ {
+	for i := 1; i < smallIter; i++ {
 		pbuf = pool.Realloc(pbuf, i)
 		if len(*pbuf) != i {
 			t.Fatalf("invalid len: %v != %v", len(*pbuf), i)

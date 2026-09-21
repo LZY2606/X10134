@@ -128,6 +128,10 @@ type Engine struct {
 	mux     sync.Mutex
 
 	isOneshot bool
+	isClosing bool
+	// connOpenFrozen is set with isClosing under mux; once true no new conn
+	// may join wgConn.
+	connOpenFrozen bool
 
 	wgConn sync.WaitGroup
 
@@ -202,29 +206,54 @@ func (g *Engine) Stop() {
 		l.stop()
 	}
 
+	if testHookStopSnapshot != nil {
+		testHookStopSnapshot()
+	}
+
+	// No new conn may join wgConn after connOpenFrozen is set. Registration
+	// paths that race this point either (a) reject the conn, or (b) were
+	// published before the flag and are present in the snapshot below.
 	g.mux.Lock()
-	conns := g.connsStd
-	g.connsStd = map[*Conn]struct{}{}
-	connsUnix := g.connsUnix
+	g.isClosing = true
+	g.connOpenFrozen = true
 	g.mux.Unlock()
 
-	g.wgConn.Done()
-	for c := range conns {
-		if c != nil {
-			cc := c
+	closeAll := func() {
+		g.mux.Lock()
+		stdConns := make([]*Conn, 0, len(g.connsStd))
+		for c := range g.connsStd {
+			if c != nil {
+				stdConns = append(stdConns, c)
+			}
+		}
+		g.connsStd = map[*Conn]struct{}{}
+		unixConns := g.connsUnix
+		g.mux.Unlock()
+
+		for _, cc := range stdConns {
+			c := cc
 			g.Async(func() {
-				_ = cc.Close()
+				_ = c.Close()
+			})
+		}
+		for _, cc := range unixConns {
+			if cc == nil {
+				continue
+			}
+			c := cc
+			g.Async(func() {
+				_ = c.Close()
 			})
 		}
 	}
-	for _, c := range connsUnix {
-		if c != nil {
-			cc := c
-			g.Async(func() {
-				_ = cc.Close()
-			})
-		}
-	}
+
+	closeAll()
+
+	// A conn whose registration interleaves with the snapshot may have
+	// joined wgConn just before closeAll observed it. Because the listeners
+	// are already down and conns only close once, a single extra sweep
+	// guarantees every tracked conn receives a Close; then wgConn drains.
+	closeAll()
 
 	g.wgConn.Wait()
 
@@ -242,6 +271,33 @@ func (g *Engine) Stop() {
 
 	g.Wait()
 	logging.Info("NBIO[%v] stop", g.Name)
+}
+
+// connOpenedLocked tracks a connection's lifetime on wgConn. The caller
+// must hold g.mux. A conn rejected while the engine is closing is never
+// tracked. The matching Done fires exactly once on the conn's first close
+// transition, independently of when user callbacks run, so a Close
+// requested while OnOpen is still executing cannot unbalance wgConn.
+//
+//go:norace
+func (g *Engine) connOpenedLocked(c *Conn) bool {
+	if g.connOpenFrozen {
+		return false
+	}
+	g.wgConn.Add(1)
+	c.wgTracked = true
+	return true
+}
+
+// connClosedDone is invoked while c.mux is held on the single transition
+// that marks a conn closed.
+//
+//go:norace
+func (g *Engine) connClosedDone(c *Conn) {
+	if c.wgTracked {
+		c.wgTracked = false
+		g.wgConn.Done()
+	}
 }
 
 // Shutdown stops Engine gracefully with context.
@@ -313,10 +369,7 @@ func (g *Engine) OnOpen(h func(c *Conn)) {
 	if h == nil {
 		panic("invalid handler: nil")
 	}
-	g.onOpen = func(c *Conn) {
-		g.wgConn.Add(1)
-		h(c)
-	}
+	g.onOpen = h
 }
 
 // OnClose registers callback for disconnected.
@@ -328,7 +381,6 @@ func (g *Engine) OnClose(h func(c *Conn, err error)) {
 	}
 	g.onClose = func(c *Conn, err error) {
 		g.Async(func() {
-			defer g.wgConn.Done()
 			h(c, err)
 		})
 	}
@@ -459,7 +511,6 @@ func (g *Engine) PollerBufferPtr(c *Conn) *[]byte {
 
 //go:norace
 func (g *Engine) initHandlers() {
-	g.wgConn.Add(1)
 	g.OnOpen(func(c *Conn) {})
 	g.OnClose(func(c *Conn, err error) {})
 	// g.OnRead(func(c *Conn, b []byte) ([]byte, error) {
