@@ -122,6 +122,8 @@ type Conn struct {
 
 	typ    ConnType
 	closed bool
+	// teardown (release write cache, unregister poller, close fd) has run.
+	released bool
 
 	// whether the writing event has been set in the poller.
 	isWAdded bool
@@ -353,14 +355,18 @@ func (c *Conn) Write(b []byte) (int, error) {
 		c.mux.Unlock()
 		return -1, net.ErrClosed
 	}
+	if testHookWriteLocked != nil {
+		testHookWriteLocked(c)
+	}
 
 	n, err := c.write(b)
 	if err != nil &&
 		!errors.Is(err, syscall.EINTR) &&
 		!errors.Is(err, syscall.EAGAIN) {
 		c.closed = true
+		closeErr := err
 		c.mux.Unlock()
-		_ = c.closeWithErrorWithoutLock(err)
+		c.closeAfterUnlocked(closeErr)
 		return n, err
 	}
 
@@ -392,6 +398,9 @@ func (c *Conn) Writev(in [][]byte) (int, error) {
 
 		return 0, net.ErrClosed
 	}
+	if testHookWriteLocked != nil {
+		testHookWriteLocked(c)
+	}
 
 	var n int
 	var err error
@@ -405,8 +414,9 @@ func (c *Conn) Writev(in [][]byte) (int, error) {
 		!errors.Is(err, syscall.EINTR) &&
 		!errors.Is(err, syscall.EAGAIN) {
 		c.closed = true
+		closeErr := err
 		c.mux.Unlock()
-		_ = c.closeWithErrorWithoutLock(err)
+		c.closeAfterUnlocked(closeErr)
 		return n, err
 	}
 	if len(c.writeList) == 0 {
@@ -941,7 +951,9 @@ func (c *Conn) flush() error {
 		}
 		if err != nil {
 			c.closed = true
-			_ = c.closeWithErrorWithoutLock(err)
+			closeErr := err
+			c.mux.Unlock()
+			_ = c.closeAfterUnlocked(closeErr)
 			return err
 		}
 	}
@@ -993,14 +1005,39 @@ func (c *Conn) closeWithError(err error) error {
 		}
 
 		c.mux.Unlock()
-		return c.closeWithErrorWithoutLock(err)
+		return c.closeWithErrorLocked(err)
 	}
 	c.mux.Unlock()
 	return nil
 }
 
+// closeAfterUnlocked runs the close path when the caller has already
+// marked c.closed and released c.mux. It must not be called with c.mux
+// held, because the close path may run user OnClose synchronously (on
+// poller threads) and the user is allowed to call Close again.
+//
+//go:norace
+func (c *Conn) closeAfterUnlocked(err error) error {
+	c.mux.Lock()
+	defer c.mux.Unlock()
+	return c.closeWithErrorLocked(err)
+}
+
+//go:norace
+func (c *Conn) closeWithErrorLocked(err error) error {
+	if c.released {
+		return nil
+	}
+	return c.closeWithErrorWithoutLock(err)
+}
+
 //go:norace
 func (c *Conn) closeWithErrorWithoutLock(err error) error {
+	if c.released {
+		return nil
+	}
+	c.released = true
+
 	c.closeErr = err
 
 	if c.writeList != nil {

@@ -124,6 +124,7 @@ func (p *poller) start() {
 	if p.isListener {
 		var err error
 		p.shutdown = false
+		defer p.g.wgListener.Done()
 		for !p.shutdown {
 			err = p.accept()
 			if err != nil {

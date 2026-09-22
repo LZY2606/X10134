@@ -130,6 +130,10 @@ type Engine struct {
 	isOneshot bool
 
 	wgConn sync.WaitGroup
+	// wgListener tracks running listener goroutines. Stop waits for them to
+	// exit before snapshotting connections, so that every accepted connection
+	// is either fully registered or rejected before shutdown closes conns.
+	wgListener sync.WaitGroup
 
 	// store std connections, for Windows only.
 	connsStd map[*Conn]struct{}
@@ -201,6 +205,10 @@ func (g *Engine) Stop() {
 	for _, l := range g.listeners {
 		l.stop()
 	}
+	// wait for all acceptors to finish accepting and registering conns,
+	// otherwise a conn accepted after the snapshot below would keep
+	// wgConn unbalanced and hang Stop.
+	g.wgListener.Wait()
 
 	g.mux.Lock()
 	conns := g.connsStd

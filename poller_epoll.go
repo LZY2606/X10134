@@ -86,6 +86,14 @@ func (p *poller) addConn(c *Conn) error {
 	} else {
 		p.g.onUDPListen(c)
 	}
+	// If the conn was closed while onOpen was running, do not register a
+	// dead conn (and never clobber a fresh conn that reused the fd).
+	if c.typ != ConnTypeUDPServer && c.closed {
+		return nil
+	}
+	if testHookPreRegister != nil {
+		testHookPreRegister(c)
+	}
 	p.g.connsUnix[fd] = c
 	err := p.addRead(fd)
 	if err != nil {
@@ -167,6 +175,7 @@ func (p *poller) acceptorLoop() {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 	}
+	defer p.g.wgListener.Done()
 
 	p.shutdown = false
 	for !p.shutdown {
@@ -321,6 +330,9 @@ func (p *poller) stop() {
 		_ = p.listener.Close()
 		if p.unixSockAddr != "" {
 			_ = os.Remove(p.unixSockAddr)
+		}
+		if testHookListenerStopped != nil {
+			testHookListenerStopped(p.index)
 		}
 	} else {
 		n := uint64(1)

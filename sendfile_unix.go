@@ -103,7 +103,10 @@ func (c *Conn) Sendfile(f *os.File, remain int64) (int64, error) {
 		}
 		if err != nil {
 			c.closed = true
-			_ = c.closeWithErrorWithoutLock(err)
+			closeErr := err
+			c.mux.Unlock()
+			_ = c.closeAfterUnlocked(closeErr)
+			c.mux.Lock()
 			return 0, err
 		}
 	}
