@@ -127,6 +127,8 @@ type Engine struct {
 	Execute func(f func())
 	mux     sync.Mutex
 
+	stopping bool
+
 	isOneshot bool
 
 	wgConn sync.WaitGroup
@@ -202,11 +204,20 @@ func (g *Engine) Stop() {
 		l.stop()
 	}
 
+	if hookStopAfterListeners != nil {
+		hookStopAfterListeners()
+	}
+
 	g.mux.Lock()
+	g.stopping = true
 	conns := g.connsStd
 	g.connsStd = map[*Conn]struct{}{}
 	connsUnix := g.connsUnix
 	g.mux.Unlock()
+
+	if hookStopAfterConnsSnapshot != nil {
+		hookStopAfterConnsSnapshot()
+	}
 
 	g.wgConn.Done()
 	for c := range conns {
@@ -219,14 +230,26 @@ func (g *Engine) Stop() {
 	}
 	for _, c := range connsUnix {
 		if c != nil {
+			if hookStopConnIter != nil {
+				hookStopConnIter(c)
+			}
 			cc := c
 			g.Async(func() {
 				_ = cc.Close()
 			})
 		}
 	}
+	for c := range conns {
+		if c != nil && hookStopConnIter != nil {
+			hookStopConnIter(c)
+		}
+	}
 
 	g.wgConn.Wait()
+
+	if hookStopAfterWgConnWait != nil {
+		hookStopAfterWgConnWait()
+	}
 
 	g.onStop()
 
@@ -315,6 +338,9 @@ func (g *Engine) OnOpen(h func(c *Conn)) {
 	}
 	g.onOpen = func(c *Conn) {
 		g.wgConn.Add(1)
+		if hookOnOpenEnter != nil && connWatched(c) {
+			hookOnOpenEnter(c)
+		}
 		h(c)
 	}
 }

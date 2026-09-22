@@ -81,16 +81,45 @@ func (p *poller) addConn(c *Conn) error {
 		return err
 	}
 	c.p = p
+	p.g.mux.Lock()
+	reject := p.g.stopping
+	if reject {
+		p.g.mux.Unlock()
+		c.mux.Lock()
+		c.p = nil
+		c.mux.Unlock()
+		rejectAcceptedConnDuringStop(c)
+		return nil
+	}
+	p.g.connsUnix[fd] = c
+	c.published = true
+	p.g.mux.Unlock()
 	if c.typ != ConnTypeUDPServer {
 		p.g.onOpen(c)
 	} else {
 		p.g.onUDPListen(c)
 	}
-	p.g.connsUnix[fd] = c
 	err := p.addRead(fd)
 	if err != nil {
 		p.g.connsUnix[fd] = nil
+	}
+	c.mux.Lock()
+	c.openDone = true
+	var pending bool
+	var pendingErr error
+	pending = c.pendingClose
+	if pending {
+		pendingErr = c.pendingErr
+		c.pendingClose = false
+	}
+	c.mux.Unlock()
+	if err != nil {
+		p.g.mux.Lock()
+		p.g.connsUnix[fd] = nil
+		p.g.mux.Unlock()
 		_ = c.closeWithError(err)
+	} else if pending {
+		_ = c.closeWithError(pendingErr)
 	}
 	return err
 }
@@ -109,7 +138,16 @@ func (p *poller) addDialer(c *Conn) error {
 		return err
 	}
 	c.p = p
+	p.g.mux.Lock()
+	reject := p.g.stopping
+	if reject {
+		p.g.mux.Unlock()
+		rejectDialerConnDuringStop(c)
+		return nil
+	}
 	p.g.connsUnix[fd] = c
+	c.published = true
+	p.g.mux.Unlock()
 	c.isWAdded = true
 	err := p.addReadWrite(fd)
 	if err != nil {

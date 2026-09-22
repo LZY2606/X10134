@@ -40,6 +40,9 @@ func (c *Conn) newToWriteBuf(buf []byte) {
 		copy(*pbuf, buf)
 		t.buf = pbuf
 		c.writeList = append(c.writeList, t)
+		if len(c.writeList) >= 2 && hookWriteQueued != nil && connWatched(c) {
+			hookWriteQueued(c)
+		}
 	}
 
 	if len(c.writeList) == 0 {
@@ -122,11 +125,25 @@ type Conn struct {
 
 	typ    ConnType
 	closed bool
+	// published indicates the connection is inside a poller's conn table.
+	// Close racing addConn before publication parks the request instead of
+	// closing an unpublished fd; addConn performs the teardown once it has
+	// published the connection, so onClose is still delivered exactly once.
+	published    bool
+	pendingClose bool
+	pendingErr   error
+	// openDone marks the user's OnOpen handler as returned. A close racing
+	// a still-running OnOpen parks until addConn finishes the callback.
+	openDone bool
 
 	// whether the writing event has been set in the poller.
 	isWAdded bool
 	// the first closing error.
 	closeErr error
+	// teardownDone makes the unlocked close teardown exactly-once when a
+	// closeWithError caller (holding c.mux) races another path that already
+	// set closed and released the lock.
+	teardownDone int32
 
 	// local addr.
 	lAddr net.Addr
@@ -358,6 +375,7 @@ func (c *Conn) Write(b []byte) (int, error) {
 	if err != nil &&
 		!errors.Is(err, syscall.EINTR) &&
 		!errors.Is(err, syscall.EAGAIN) {
+		atomic.StoreInt32(&c.teardownDone, 1)
 		c.closed = true
 		c.mux.Unlock()
 		_ = c.closeWithErrorWithoutLock(err)
@@ -404,6 +422,7 @@ func (c *Conn) Writev(in [][]byte) (int, error) {
 	if err != nil &&
 		!errors.Is(err, syscall.EINTR) &&
 		!errors.Is(err, syscall.EAGAIN) {
+		atomic.StoreInt32(&c.teardownDone, 1)
 		c.closed = true
 		c.mux.Unlock()
 		_ = c.closeWithErrorWithoutLock(err)
@@ -681,7 +700,9 @@ func (c *Conn) SetLinger(onoff int32, linger int32) error {
 func (c *Conn) modWrite() {
 	if !c.closed && !c.isWAdded {
 		c.isWAdded = true
-		_ = c.p.modWrite(c.fd)
+		if c.p != nil {
+			_ = c.p.modWrite(c.fd)
+		}
 	}
 }
 
@@ -692,7 +713,9 @@ func (c *Conn) resetRead() {
 	if !c.closed && c.isWAdded {
 		c.isWAdded = false
 		p := c.p
-		_ = p.resetRead(c.fd)
+		if p != nil {
+			_ = p.resetRead(c.fd)
+		}
 	}
 }
 
@@ -940,7 +963,9 @@ func (c *Conn) flush() error {
 			return nil
 		}
 		if err != nil {
+			atomic.StoreInt32(&c.teardownDone, 1)
 			c.closed = true
+			c.mux.Unlock()
 			_ = c.closeWithErrorWithoutLock(err)
 			return err
 		}
@@ -980,9 +1005,35 @@ func (c *Conn) overflow(n int) bool {
 //go:norace
 func (c *Conn) closeWithError(err error) error {
 	c.mux.Lock()
-	if !c.closed {
+	if c.p == nil {
+		// addConn is still inserting this connection: park the close until
+		// publication completes, otherwise the fd would vanish without ever
+		// producing its single onClose.
+		c.pendingClose = true
+		if err != nil && c.pendingErr == nil {
+			c.pendingErr = err
+		}
+		if hookConnPending != nil && connWatched(c) {
+			hookConnPending(c)
+		}
+		c.mux.Unlock()
+		return nil
+	}
+	if !c.openDone {
+		// OnOpen is running on the poller goroutine. The racing Close is
+		// acknowledged immediately (it must not block its own caller or the
+		// poller) and the teardown is deferred: addConn performs it after the
+		// user OnOpen returns, so wgConn brackets the whole callback and the
+		// single onClose is emitted after the single onOpen.
+		c.pendingClose = true
+		if err != nil && c.pendingErr == nil {
+			c.pendingErr = err
+		}
+		c.mux.Unlock()
+		return nil
+	}
+	if atomic.CompareAndSwapInt32(&c.teardownDone, 0, 1) {
 		c.closed = true
-
 		if c.wTimer != nil {
 			c.wTimer.Stop()
 			c.wTimer = nil
@@ -991,7 +1042,6 @@ func (c *Conn) closeWithError(err error) error {
 			c.rTimer.Stop()
 			c.rTimer = nil
 		}
-
 		c.mux.Unlock()
 		return c.closeWithErrorWithoutLock(err)
 	}
@@ -1001,6 +1051,9 @@ func (c *Conn) closeWithError(err error) error {
 
 //go:norace
 func (c *Conn) closeWithErrorWithoutLock(err error) error {
+	if !atomic.CompareAndSwapInt32(&c.teardownDone, 0, 1) {
+		return nil
+	}
 	c.closeErr = err
 
 	if c.writeList != nil {
