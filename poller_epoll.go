@@ -172,6 +172,9 @@ func (p *poller) acceptorLoop() {
 	for !p.shutdown {
 		conn, err := p.listener.Accept()
 		if err == nil {
+			if testHookAfterAccept != nil {
+				testHookAfterAccept()
+			}
 			var c *Conn
 			c, err = NBConn(conn)
 			if err != nil {
