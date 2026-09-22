@@ -8,6 +8,7 @@
 package nbio
 
 import (
+	"sync/atomic"
 	"errors"
 	"net"
 	"runtime"
@@ -37,7 +38,7 @@ type poller struct {
 	pollType   string
 	isListener bool
 	listener   net.Listener
-	shutdown   bool
+	shutdown   int32 // accessed atomically
 
 	chStop chan struct{}
 }
@@ -50,6 +51,9 @@ func (p *poller) accept() error {
 	}
 
 	c := newConn(conn)
+	if hookListenerAccepted != nil {
+		hookListenerAccepted(c)
+	}
 	o := p.g.pollers[c.Hash()%len(p.g.pollers)]
 	o.addConn(c)
 
@@ -77,10 +81,24 @@ func (p *poller) addConn(c *Conn) error {
 	p.g.mux.Unlock()
 	// should not call onOpen for udp server conn
 	if c.typ != ConnTypeUDPServer {
+		// A close requested from another goroutine while onOpen runs is
+		// recorded but applied only after the callback returns, so onClose
+		// can never be dispatched before onOpen for the same Conn.
+		c.opening = true
 		p.g.onOpen(c)
+		c.mux.Lock()
+		c.opening = false
+		if c.closed {
+			if err := c.destroyConn(); err != nil {
+				c.mux.Unlock()
+				return err
+			}
+		}
+		c.mux.Unlock()
 	} else {
 		p.g.onUDPListen(c)
 	}
+
 	// should not read udp client from reading udp server conn
 	if c.typ != ConnTypeUDPClientFromRead {
 		go p.readConn(c)
@@ -123,8 +141,8 @@ func (p *poller) start() {
 
 	if p.isListener {
 		var err error
-		p.shutdown = false
-		for !p.shutdown {
+		atomic.StoreInt32(&p.shutdown, 0)
+		for atomic.LoadInt32(&p.shutdown) == 0 {
 			err = p.accept()
 			if err != nil {
 				var ne net.Error
@@ -132,7 +150,7 @@ func (p *poller) start() {
 					logging.Error("NBIO[%v][%v_%v] Accept failed: timeout error, retrying...", p.g.Name, p.pollType, p.index)
 					time.Sleep(time.Second / 20)
 				} else {
-					if !p.shutdown {
+					if atomic.LoadInt32(&p.shutdown) == 0 {
 						logging.Error("NBIO[%v][%v_%v] Accept failed: %v, exit...", p.g.Name, p.pollType, p.index, err)
 					}
 					if p.g.onAcceptError != nil {
@@ -149,7 +167,7 @@ func (p *poller) start() {
 //go:norace
 func (p *poller) stop() {
 	logging.Debug("NBIO[%v][%v_%v] stop...", p.g.Name, p.pollType, p.index)
-	p.shutdown = true
+	atomic.StoreInt32(&p.shutdown, 1)
 	if p.isListener {
 		p.listener.Close()
 	}

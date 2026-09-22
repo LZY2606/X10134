@@ -83,7 +83,11 @@ func (g *Engine) Start() error {
 	// Start TCP/Unix listener pollers.
 	for _, l := range g.listeners {
 		g.Add(1)
-		go l.start()
+		g.listenerWG.Add(1)
+		go func(l *poller) {
+			defer g.listenerWG.Done()
+			l.start()
+		}(l)
 	}
 
 	// Start UDP listener pollers.

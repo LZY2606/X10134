@@ -32,9 +32,11 @@ type Conn struct {
 
 	rTimer *time.Timer
 
-	typ      ConnType
-	closed   bool
-	closeErr error
+	typ       ConnType
+	closed    bool
+	opening   bool
+	destroyed bool
+	closeErr  error
 
 	ReadBuffer []byte
 
@@ -164,6 +166,9 @@ func (c *Conn) readUDP(b []byte) (int, error) {
 //
 //go:norace
 func (c *Conn) Write(b []byte) (int, error) {
+	if hookConnBeforeWrite != nil {
+		hookConnBeforeWrite(c)
+	}
 	var n int
 	var err error
 	switch c.typ {
@@ -272,31 +277,59 @@ func (c *Conn) Writev(in [][]byte) (int, error) {
 //
 //go:norace
 func (c *Conn) Close() error {
-	var err error
+	return c.closeWithError(nil)
+}
+
+//go:norace
+func (c *Conn) closeWithError(err error) error {
+	if hookConnBeforeClose != nil {
+		hookConnBeforeClose(c)
+	}
+
 	c.mux.Lock()
-	if !c.closed {
-		c.closed = true
-
-		if c.rTimer != nil {
-			c.rTimer.Stop()
-			c.rTimer = nil
-		}
-
-		switch c.typ {
-		case ConnTypeTCP:
-			err = c.conn.Close()
-		case ConnTypeUDPServer, ConnTypeUDPClientFromDial, ConnTypeUDPClientFromRead:
-			err = c.connUDP.Close()
-		default:
-		}
-
+	if c.closed {
 		c.mux.Unlock()
-		if c.p.g != nil {
-			c.p.deleteConn(c)
-		}
-		return err
+		return nil
+	}
+	c.closed = true
+	if c.closeErr == nil {
+		c.closeErr = err
+	}
+	if !c.opening {
+		err = c.destroyConn()
+	} else {
+		err = nil
 	}
 	c.mux.Unlock()
+	return err
+}
+
+// destroyConn performs the close teardown exactly once. Callers must hold c.mux.
+//
+//go:norace
+func (c *Conn) destroyConn() error {
+	if c.destroyed {
+		return nil
+	}
+	c.destroyed = true
+
+	if c.rTimer != nil {
+		c.rTimer.Stop()
+		c.rTimer = nil
+	}
+
+	var err error
+	switch c.typ {
+	case ConnTypeTCP:
+		err = c.conn.Close()
+	case ConnTypeUDPServer, ConnTypeUDPClientFromDial, ConnTypeUDPClientFromRead:
+		err = c.connUDP.Close()
+	default:
+	}
+
+	if c.p.g != nil {
+		c.p.deleteConn(c)
+	}
 	return err
 }
 
@@ -304,10 +337,7 @@ func (c *Conn) Close() error {
 //
 //go:norace
 func (c *Conn) CloseWithError(err error) error {
-	if c.closeErr == nil {
-		c.closeErr = err
-	}
-	return c.Close()
+	return c.closeWithError(err)
 }
 
 // LocalAddr wraps net.Conn.LocalAddr.

@@ -131,6 +131,10 @@ type Engine struct {
 
 	wgConn sync.WaitGroup
 
+	// tracks listener goroutines, used to make Stop wait for an in-flight
+	// accept to be published before snapshotting the connection tables.
+	listenerWG sync.WaitGroup
+
 	// store std connections, for Windows only.
 	connsStd map[*Conn]struct{}
 
@@ -201,6 +205,13 @@ func (g *Engine) Stop() {
 	for _, l := range g.listeners {
 		l.stop()
 	}
+	if hookEngineStopBegin != nil {
+		hookEngineStopBegin(g)
+	}
+	// Wait until every listener goroutine has left its accept loop and
+	// any accepted connection has been registered before we snapshot
+	// the connection tables, otherwise such a conn would never be closed.
+	g.listenerWG.Wait()
 
 	g.mux.Lock()
 	conns := g.connsStd

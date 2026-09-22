@@ -15,6 +15,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -48,7 +49,7 @@ type poller struct {
 
 	index int
 
-	shutdown bool
+	shutdown int32 // accessed atomically
 
 	listener     net.Listener
 	isListener   bool
@@ -72,12 +73,25 @@ func (p *poller) addConn(c *Conn) error {
 		return err
 	}
 	c.p = p
+	p.g.connsUnix[fd] = c
 	if c.typ != ConnTypeUDPServer {
+		// Keep opening set for the lifetime of the user callback: a close
+		// requested from another goroutine is recorded but the teardown is
+		// deferred until the callback returns, so onClose can never be
+		// dispatched before onOpen has finished for the same Conn.
+		c.opening = true
+		defer func() {
+			c.mux.Lock()
+			c.opening = false
+			if c.closed {
+				_ = c.destroyConn(c.closeErr)
+			}
+			c.mux.Unlock()
+		}()
 		p.g.onOpen(c)
 	} else {
 		p.g.onUDPListen(c)
 	}
-	p.g.connsUnix[fd] = c
 	p.addRead(fd)
 	return nil
 }
@@ -261,8 +275,8 @@ func (p *poller) acceptorLoop() {
 		defer runtime.UnlockOSThread()
 	}
 
-	p.shutdown = false
-	for !p.shutdown {
+	atomic.StoreInt32(&p.shutdown, 0)
+	for atomic.LoadInt32(&p.shutdown) == 0 {
 		conn, err := p.listener.Accept()
 		if err == nil {
 			var c *Conn
@@ -271,6 +285,9 @@ func (p *poller) acceptorLoop() {
 				_ = conn.Close()
 				continue
 			}
+			if hookListenerAccepted != nil {
+				hookListenerAccepted(c)
+			}
 			_ = p.g.pollers[c.Hash()%len(p.g.pollers)].addConn(c)
 		} else {
 			var ne net.Error
@@ -278,7 +295,7 @@ func (p *poller) acceptorLoop() {
 				logging.Error("NBIO[%v][%v_%v] Accept failed: timeout error, retrying...", p.g.Name, p.pollType, p.index)
 				time.Sleep(time.Second / 20)
 			} else {
-				if !p.shutdown {
+				if atomic.LoadInt32(&p.shutdown) == 0 {
 					logging.Error("NBIO[%v][%v_%v] Accept failed: %v, exit...", p.g.Name, p.pollType, p.index, err)
 				}
 				if p.g.onAcceptError != nil {
@@ -299,8 +316,8 @@ func (p *poller) readWriteLoop() {
 	events := make([]syscall.Kevent_t, 1024)
 	var changes []syscall.Kevent_t
 
-	p.shutdown = false
-	for !p.shutdown {
+	atomic.StoreInt32(&p.shutdown, 0)
+	for atomic.LoadInt32(&p.shutdown) == 0 {
 		p.mux.Lock()
 		changes = p.eventList
 		p.eventList = nil
@@ -324,7 +341,7 @@ func (p *poller) readWriteLoop() {
 //go:norace
 func (p *poller) stop() {
 	logging.Debug("NBIO[%v][%v_%v] stop...", p.g.Name, p.pollType, p.index)
-	p.shutdown = true
+	atomic.StoreInt32(&p.shutdown, 1)
 	if p.listener != nil {
 		_ = p.listener.Close()
 		if p.unixSockAddr != "" {

@@ -8,6 +8,7 @@
 package nbio
 
 import (
+	"sync/atomic"
 	"errors"
 	"fmt"
 	"io"
@@ -54,7 +55,7 @@ type poller struct {
 
 	pollType string // listener or io poller
 
-	shutdown bool // state
+	shutdown int32 // state, accessed atomically
 
 	// whether poller is used for listener.
 	isListener bool
@@ -81,12 +82,23 @@ func (p *poller) addConn(c *Conn) error {
 		return err
 	}
 	c.p = p
+	p.g.connsUnix[fd] = c
 	if c.typ != ConnTypeUDPServer {
+		// See poller_kqueue.go: defer the close teardown until the user
+		// onOpen callback has returned.
+		c.opening = true
+		defer func() {
+			c.mux.Lock()
+			c.opening = false
+			if c.closed {
+				_ = c.destroyConn(c.closeErr)
+			}
+			c.mux.Unlock()
+		}()
 		p.g.onOpen(c)
 	} else {
 		p.g.onUDPListen(c)
 	}
-	p.g.connsUnix[fd] = c
 	err := p.addRead(fd)
 	if err != nil {
 		p.g.connsUnix[fd] = nil
@@ -168,8 +180,8 @@ func (p *poller) acceptorLoop() {
 		defer runtime.UnlockOSThread()
 	}
 
-	p.shutdown = false
-	for !p.shutdown {
+	atomic.StoreInt32(&p.shutdown, 0)
+	for atomic.LoadInt32(&p.shutdown) == 0 {
 		conn, err := p.listener.Accept()
 		if err == nil {
 			var c *Conn
@@ -177,6 +189,9 @@ func (p *poller) acceptorLoop() {
 			if err != nil {
 				_ = conn.Close()
 				continue
+			}
+			if hookListenerAccepted != nil {
+				hookListenerAccepted(c)
 			}
 			err = p.g.pollers[c.Hash()%len(p.g.pollers)].addConn(c)
 			if err != nil {
@@ -198,7 +213,7 @@ func (p *poller) acceptorLoop() {
 				)
 				time.Sleep(time.Second / 20)
 			} else {
-				if !p.shutdown {
+				if atomic.LoadInt32(&p.shutdown) == 0 {
 					logging.Error("NBIO[%v][%v_%v] Accept failed: %v, exit...",
 						p.g.Name,
 						p.pollType,
@@ -229,10 +244,10 @@ func (p *poller) readWriteLoop() {
 	}
 
 	g := p.g
-	p.shutdown = false
+	atomic.StoreInt32(&p.shutdown, 0)
 	isOneshot := g.isOneshot
 	asyncReadEnabled := g.AsyncReadInPoller && (g.EpollMod == EPOLLET)
-	for !p.shutdown {
+	for atomic.LoadInt32(&p.shutdown) == 0 {
 		n, err := syscall.EpollWait(p.epfd, events, msec)
 		if err != nil && !errors.Is(err, syscall.EINTR) {
 			logging.Error("NBIO[%v][%v_%v] EpollWait failed: %v, exit...",
@@ -316,7 +331,7 @@ func (p *poller) readWriteLoop() {
 //go:norace
 func (p *poller) stop() {
 	logging.Debug("NBIO[%v][%v_%v] stop...", p.g.Name, p.pollType, p.index)
-	p.shutdown = true
+	atomic.StoreInt32(&p.shutdown, 1)
 	if p.listener != nil {
 		_ = p.listener.Close()
 		if p.unixSockAddr != "" {

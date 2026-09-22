@@ -120,8 +120,13 @@ type Conn struct {
 	// cache for buffers or files to be sent.
 	writeList []*toWrite
 
-	typ    ConnType
-	closed bool
+	typ     ConnType
+	closed  bool
+	opening bool
+
+	// destroyed is set once the close teardown (fd close, table delete,
+	// onClose dispatch) has run, guarded by mux.
+	destroyed bool
 
 	// whether the writing event has been set in the poller.
 	isWAdded bool
@@ -347,6 +352,9 @@ func (c *Conn) readUDP(b []byte) (*Conn, int, error) {
 //go:norace
 func (c *Conn) Write(b []byte) (int, error) {
 	// c.p.g.beforeWrite(c)
+	if hookConnBeforeWrite != nil {
+		hookConnBeforeWrite(c)
+	}
 
 	c.mux.Lock()
 	if c.closed {
@@ -359,8 +367,8 @@ func (c *Conn) Write(b []byte) (int, error) {
 		!errors.Is(err, syscall.EINTR) &&
 		!errors.Is(err, syscall.EAGAIN) {
 		c.closed = true
+		c.destroyConn(err)
 		c.mux.Unlock()
-		_ = c.closeWithErrorWithoutLock(err)
 		return n, err
 	}
 
@@ -405,8 +413,8 @@ func (c *Conn) Writev(in [][]byte) (int, error) {
 		!errors.Is(err, syscall.EINTR) &&
 		!errors.Is(err, syscall.EAGAIN) {
 		c.closed = true
+		c.destroyConn(err)
 		c.mux.Unlock()
-		_ = c.closeWithErrorWithoutLock(err)
 		return n, err
 	}
 	if len(c.writeList) == 0 {
@@ -941,7 +949,7 @@ func (c *Conn) flush() error {
 		}
 		if err != nil {
 			c.closed = true
-			_ = c.closeWithErrorWithoutLock(err)
+			c.destroyConn(err)
 			return err
 		}
 	}
@@ -979,29 +987,46 @@ func (c *Conn) overflow(n int) bool {
 
 //go:norace
 func (c *Conn) closeWithError(err error) error {
+	if hookConnBeforeClose != nil {
+		hookConnBeforeClose(c)
+	}
+
 	c.mux.Lock()
-	if !c.closed {
-		c.closed = true
-
-		if c.wTimer != nil {
-			c.wTimer.Stop()
-			c.wTimer = nil
-		}
-		if c.rTimer != nil {
-			c.rTimer.Stop()
-			c.rTimer = nil
-		}
-
+	if c.closed {
 		c.mux.Unlock()
-		return c.closeWithErrorWithoutLock(err)
+		return nil
+	}
+	c.closed = true
+	if !c.opening {
+		c.destroyConn(err)
 	}
 	c.mux.Unlock()
 	return nil
 }
 
+// destroyConn performs the close teardown exactly once. Callers must hold c.mux.
+//
 //go:norace
-func (c *Conn) closeWithErrorWithoutLock(err error) error {
-	c.closeErr = err
+func (c *Conn) destroyConn(err error) error {
+	if c.destroyed {
+		return nil
+	}
+	c.destroyed = true
+
+	if c.wTimer != nil {
+		c.wTimer.Stop()
+		c.wTimer = nil
+	}
+	if c.rTimer != nil {
+		c.rTimer.Stop()
+		c.rTimer = nil
+	}
+
+	if c.closeErr == nil {
+		c.closeErr = err
+	} else if err != nil {
+		c.closeErr = err
+	}
 
 	if c.writeList != nil {
 		for _, t := range c.writeList {
@@ -1023,6 +1048,17 @@ func (c *Conn) closeWithErrorWithoutLock(err error) error {
 	}
 
 	return err
+}
+
+//go:norace
+func (c *Conn) closeWithErrorWithoutLock(err error) error {
+	c.mux.Lock()
+	defer c.mux.Unlock()
+	if c.closed && c.destroyed {
+		return nil
+	}
+	c.closed = true
+	return c.destroyConn(err)
 }
 
 // NBConn converts net.Conn to *Conn.
