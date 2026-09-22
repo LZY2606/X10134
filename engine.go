@@ -226,6 +226,10 @@ func (g *Engine) Stop() {
 		}
 	}
 
+	if testHookBeforeStopWait != nil {
+		testHookBeforeStopWait()
+	}
+
 	g.wgConn.Wait()
 
 	g.onStop()
