@@ -72,14 +72,34 @@ func (p *poller) addConn(c *Conn) error {
 		return err
 	}
 	c.p = p
-	if c.typ != ConnTypeUDPServer {
-		p.g.onOpen(c)
-	} else {
-		p.g.onUDPListen(c)
+	g := p.g
+
+	g.mux.Lock()
+	if g.stopping {
+		g.mux.Unlock()
+		if c.typ == ConnTypeTCP || c.typ == ConnTypeUnix {
+			_ = syscall.Close(c.fd)
+		}
+		return engineClosing
 	}
+	if c.typ == ConnTypeUDPServer {
+		g.mux.Unlock()
+		g.onUDPListen(c)
+		g.connsUnix[fd] = c
+		p.addRead(fd)
+		return nil
+	}
+	g.wgConn.Add(1)
 	p.g.connsUnix[fd] = c
-	p.addRead(fd)
-	return nil
+	c.beginOpen()
+	g.mux.Unlock()
+
+	g.onOpen(c)
+
+	return c.finishOpen(func(fd int) error {
+		p.addRead(fd)
+		return nil
+	})
 }
 
 //go:norace
@@ -271,7 +291,10 @@ func (p *poller) acceptorLoop() {
 				_ = conn.Close()
 				continue
 			}
-			_ = p.g.pollers[c.Hash()%len(p.g.pollers)].addConn(c)
+			err = p.g.pollers[c.Hash()%len(p.g.pollers)].addConn(c)
+			if errors.Is(err, engineClosing) {
+				_ = syscall.Close(c.fd)
+			}
 		} else {
 			var ne net.Error
 			if ok := errors.As(err, &ne); ok && ne.Timeout() {

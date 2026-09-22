@@ -122,6 +122,11 @@ type Conn struct {
 
 	typ    ConnType
 	closed bool
+	// opening is true while the poller registers the conn and runs onOpen.
+	// While opening, a Close only marks the conn: the poller's finishOpen
+	// performs the single teardown after onOpen returned, so the close
+	// event never overtakes the open event for one conn.
+	opening bool
 
 	// whether the writing event has been set in the poller.
 	isWAdded bool
@@ -326,6 +331,15 @@ func (c *Conn) readUDP(b []byte) (*Conn, int, error) {
 		// get or create and cache the consistent connection for the socket
 		// that has the same local addr and remote addr.
 		uc, ok := c.connUDP.getConn(c.p, c.fd, rAddr)
+		if !ok {
+			g.mux.Lock()
+			if g.stopping {
+				g.mux.Unlock()
+				return c, 0, net.ErrClosed
+			}
+			g.wgConn.Add(1)
+			g.mux.Unlock()
+		}
 		if g.UDPReadTimeout > 0 {
 			_ = uc.SetReadDeadline(time.Now().Add(g.UDPReadTimeout))
 		}
@@ -353,14 +367,21 @@ func (c *Conn) Write(b []byte) (int, error) {
 		c.mux.Unlock()
 		return -1, net.ErrClosed
 	}
+	if testHookConnWrite != nil {
+		c.mux.Unlock()
+		testHookConnWrite(c)
+		c.mux.Lock()
+		if c.closed {
+			c.mux.Unlock()
+			return -1, net.ErrClosed
+		}
+	}
 
 	n, err := c.write(b)
 	if err != nil &&
 		!errors.Is(err, syscall.EINTR) &&
 		!errors.Is(err, syscall.EAGAIN) {
-		c.closed = true
-		c.mux.Unlock()
-		_ = c.closeWithErrorWithoutLock(err)
+		_ = c.failWriteLocked(err)
 		return n, err
 	}
 
@@ -404,9 +425,7 @@ func (c *Conn) Writev(in [][]byte) (int, error) {
 	if err != nil &&
 		!errors.Is(err, syscall.EINTR) &&
 		!errors.Is(err, syscall.EAGAIN) {
-		c.closed = true
-		c.mux.Unlock()
-		_ = c.closeWithErrorWithoutLock(err)
+		_ = c.failWriteLocked(err)
 		return n, err
 	}
 	if len(c.writeList) == 0 {
@@ -802,6 +821,16 @@ func (c *Conn) flush() error {
 		return nil
 	}
 
+	if testHookConnFlush != nil {
+		testHookConnFlush(c)
+		if c.closed {
+			return net.ErrClosed
+		}
+		if len(c.writeList) == 0 {
+			return nil
+		}
+	}
+
 	onWrittenSize := c.p.g.onWrittenSize
 
 	// iovc := make([][]byte, 4)[0:0]
@@ -981,27 +1010,116 @@ func (c *Conn) overflow(n int) bool {
 func (c *Conn) closeWithError(err error) error {
 	c.mux.Lock()
 	if !c.closed {
-		c.closed = true
-
-		if c.wTimer != nil {
-			c.wTimer.Stop()
-			c.wTimer = nil
-		}
-		if c.rTimer != nil {
-			c.rTimer.Stop()
-			c.rTimer = nil
-		}
-
-		c.mux.Unlock()
-		return c.closeWithErrorWithoutLock(err)
+		return c.markClosedLocked(err)
 	}
 	c.mux.Unlock()
 	return nil
 }
 
+// failWriteLocked closes a conn whose in-progress write returned a fatal
+// error. It must be called with c.mux held.
+//
+//go:norace
+func (c *Conn) failWriteLocked(err error) error {
+	defer c.mux.Unlock()
+	return c.markClosedLocked(err)
+}
+
+// markClosedLocked marks the conn closed and either tears it down now or lets
+// the opener do the single teardown in finishOpen. It must be called with
+// c.mux held and unlocks c.mux.
+//
+//go:norace
+func (c *Conn) markClosedLocked(err error) error {
+	c.closed = true
+	c.closeErr = err
+
+	if c.wTimer != nil {
+		c.wTimer.Stop()
+		c.wTimer = nil
+	}
+	if c.rTimer != nil {
+		c.rTimer.Stop()
+		c.rTimer = nil
+	}
+
+	opening := c.opening
+	c.mux.Unlock()
+	if opening {
+		// The opener (poller registration goroutine) runs the one
+		// teardown in finishOpen after onOpen has returned.
+		return nil
+	}
+	return c.closeWithErrorWithoutLock(err)
+}
+
+// beginOpen marks the conn as being opened by the poller. The caller must
+// pair it with finishOpen and must hold g.mux when calling beginOpen.
+//
+//go:norace
+func (c *Conn) beginOpen() {
+	c.mux.Lock()
+	c.opening = true
+	c.mux.Unlock()
+}
+
+// finishOpen is called after the user onOpen callback has returned. It adds
+// the read event and performs the single connection teardown when a Close
+// raced with onOpen. The handoff between opening and closed is decided under
+// c.mux so that exactly one path tears the conn down.
+//
+//go:norace
+func (c *Conn) finishOpen(addRead func(fd int) error) error {
+	if testHookConnAfterOpen != nil {
+		testHookConnAfterOpen(c)
+	}
+
+	var (
+		doRead  = addRead != nil
+		readErr error
+	)
+
+	if doRead {
+		c.mux.Lock()
+		closedEarly := c.closed
+		c.mux.Unlock()
+		if !closedEarly {
+			readErr = addRead(c.fd)
+		}
+	}
+
+	var (
+		doTeardown bool
+		closeErr   error
+	)
+
+	c.mux.Lock()
+	c.opening = false
+	if readErr == nil && addRead != nil {
+		c.isWAdded = false
+	}
+	if c.closed {
+		doTeardown = true
+		closeErr = c.closeErr
+	} else if readErr != nil {
+		c.closed = true
+		c.closeErr = readErr
+		doTeardown = true
+		closeErr = readErr
+	}
+	c.mux.Unlock()
+
+	if doTeardown {
+		return c.closeWithErrorWithoutLock(closeErr)
+	}
+	return readErr
+}
+
 //go:norace
 func (c *Conn) closeWithErrorWithoutLock(err error) error {
-	c.closeErr = err
+	if c.closeErr == nil {
+		c.closeErr = err
+	}
 
 	if c.writeList != nil {
 		for _, t := range c.writeList {

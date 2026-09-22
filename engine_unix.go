@@ -241,10 +241,19 @@ func (engine *Engine) DialAsyncTimeout(network, addr string, timeout time.Durati
 		}
 	}
 
+	engine.mux.Lock()
+	if engine.stopping {
+		engine.mux.Unlock()
+		_ = syscall.Close(fd)
+		return engineClosing
+	}
 	engine.wgConn.Add(1)
+	engine.mux.Unlock()
+
 	_, err = engine.addDialer(c)
 	if err != nil {
 		engine.wgConn.Done()
+		_ = syscall.Close(fd)
 		return err
 	}
 

@@ -71,18 +71,43 @@ func (p *poller) readConn(c *Conn) {
 
 //go:norace
 func (p *poller) addConn(c *Conn) error {
-	c.p = p
-	p.g.mux.Lock()
-	p.g.connsStd[c] = struct{}{}
-	p.g.mux.Unlock()
-	// should not call onOpen for udp server conn
-	if c.typ != ConnTypeUDPServer {
-		p.g.onOpen(c)
-	} else {
-		p.g.onUDPListen(c)
+	g := p.g
+
+	g.mux.Lock()
+	if g.stopping {
+		g.mux.Unlock()
+		return engineClosing
 	}
+	c.p = p
+	g.connsStd[c] = struct{}{}
+	if c.typ == ConnTypeUDPServer {
+		g.mux.Unlock()
+		g.onUDPListen(c)
+		return nil
+	}
+	g.wgConn.Add(1)
+	c.opening = true
+	g.mux.Unlock()
+
+	// should not call onOpen for udp server conn
+	g.onOpen(c)
+
+	// Handoff: decide under c.mux who performs the single teardown.
+	var err error
+	doRead := true
+	c.mux.Lock()
+	c.opening = false
+	if c.closed {
+		err = c.teardownStdLocked()
+		doRead = false
+	}
+	c.mux.Unlock()
+	if err != nil {
+		return err
+	}
+
 	// should not read udp client from reading udp server conn
-	if c.typ != ConnTypeUDPClientFromRead {
+	if doRead && c.typ != ConnTypeUDPClientFromRead {
 		go p.readConn(c)
 	}
 
@@ -91,8 +116,12 @@ func (p *poller) addConn(c *Conn) error {
 
 //go:norace
 func (p *poller) addDialer(c *Conn) error {
-	c.p = p
 	p.g.mux.Lock()
+	if p.g.stopping {
+		p.g.mux.Unlock()
+		return engineClosing
+	}
+	c.p = p
 	p.g.connsStd[c] = struct{}{}
 	p.g.mux.Unlock()
 	go p.readConn(c)

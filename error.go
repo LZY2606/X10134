@@ -21,4 +21,8 @@ var (
 	ErrDialTimeout = errors.New("dial timeout")
 
 	ErrUnsupported = errors.New("unsupported operation")
+
+	// engineClosing is returned internally when a conn is added after Stop
+	// has taken its conn snapshot; it is never delivered to user callbacks.
+	engineClosing = errors.New("engine is closing")
 )

@@ -32,8 +32,11 @@ type Conn struct {
 
 	rTimer *time.Timer
 
-	typ      ConnType
-	closed   bool
+	typ    ConnType
+	closed bool
+	// opening mirrors the *nix path: while true a Close only marks the
+	// conn, the addConn opener runs the single teardown after onOpen.
+	opening  bool
 	closeErr error
 
 	ReadBuffer []byte
@@ -277,6 +280,11 @@ func (c *Conn) Close() error {
 	if !c.closed {
 		c.closed = true
 
+		if c.opening {
+			c.mux.Unlock()
+			return nil
+		}
+
 		if c.rTimer != nil {
 			c.rTimer.Stop()
 			c.rTimer = nil
@@ -297,6 +305,31 @@ func (c *Conn) Close() error {
 		return err
 	}
 	c.mux.Unlock()
+	return err
+}
+
+// markClosedLocked marks the conn closed while it is being opened and runs
+// the single teardown after the opener's handoff decision. It must be
+// called with c.mux held.
+//
+//go:norace
+func (c *Conn) teardownStdLocked() error {
+	var err error
+	if c.rTimer != nil {
+		c.rTimer.Stop()
+		c.rTimer = nil
+	}
+	switch c.typ {
+	case ConnTypeTCP:
+		err = c.conn.Close()
+	case ConnTypeUDPServer, ConnTypeUDPClientFromDial, ConnTypeUDPClientFromRead:
+		err = c.connUDP.Close()
+	default:
+	}
+	c.mux.Unlock()
+	if c.p != nil && c.p.g != nil {
+		c.p.deleteConn(c)
+	}
 	return err
 }
 

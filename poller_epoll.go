@@ -81,18 +81,30 @@ func (p *poller) addConn(c *Conn) error {
 		return err
 	}
 	c.p = p
-	if c.typ != ConnTypeUDPServer {
-		p.g.onOpen(c)
-	} else {
-		p.g.onUDPListen(c)
+	g := p.g
+
+	g.mux.Lock()
+	if g.stopping {
+		g.mux.Unlock()
+		if c.typ == ConnTypeTCP || c.typ == ConnTypeUnix {
+			_ = syscall.Close(c.fd)
+		}
+		return engineClosing
 	}
-	p.g.connsUnix[fd] = c
-	err := p.addRead(fd)
-	if err != nil {
-		p.g.connsUnix[fd] = nil
-		_ = c.closeWithError(err)
+	if c.typ == ConnTypeUDPServer {
+		g.mux.Unlock()
+		g.onUDPListen(c)
+		g.connsUnix[fd] = c
+		return p.addRead(fd)
 	}
-	return err
+	g.wgConn.Add(1)
+	g.connsUnix[fd] = c
+	c.beginOpen()
+	g.mux.Unlock()
+
+	g.onOpen(c)
+
+	return c.finishOpen(p.addRead)
 }
 
 // add the connection to poller and handle its io events.
@@ -180,6 +192,10 @@ func (p *poller) acceptorLoop() {
 			}
 			err = p.g.pollers[c.Hash()%len(p.g.pollers)].addConn(c)
 			if err != nil {
+				if errors.Is(err, engineClosing) {
+					_ = syscall.Close(c.fd)
+					continue
+				}
 				logging.Error("NBIO[%v][%v_%v] addConn [fd: %v] failed: %v",
 					p.g.Name,
 					p.pollType,

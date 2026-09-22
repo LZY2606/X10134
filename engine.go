@@ -128,6 +128,9 @@ type Engine struct {
 	mux     sync.Mutex
 
 	isOneshot bool
+	// stopping is set under mux when Stop begins, it prevents new conns from
+	// being registered or accounting on wgConn after Stop took its snapshot.
+	stopping bool
 
 	wgConn sync.WaitGroup
 
@@ -203,6 +206,10 @@ func (g *Engine) Stop() {
 	}
 
 	g.mux.Lock()
+	g.stopping = true
+	if testHookStopAfterStoppingSet != nil {
+		testHookStopAfterStoppingSet()
+	}
 	conns := g.connsStd
 	g.connsStd = map[*Conn]struct{}{}
 	connsUnix := g.connsUnix
@@ -313,10 +320,7 @@ func (g *Engine) OnOpen(h func(c *Conn)) {
 	if h == nil {
 		panic("invalid handler: nil")
 	}
-	g.onOpen = func(c *Conn) {
-		g.wgConn.Add(1)
-		h(c)
-	}
+	g.onOpen = h
 }
 
 // OnClose registers callback for disconnected.
