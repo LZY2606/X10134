@@ -50,10 +50,9 @@ func (p *poller) accept() error {
 	}
 
 	c := newConn(conn)
+	runHookAfterAccept(conn)
 	o := p.g.pollers[c.Hash()%len(p.g.pollers)]
-	o.addConn(c)
-
-	return nil
+	return o.addConn(c)
 }
 
 //go:norace
@@ -73,7 +72,15 @@ func (p *poller) readConn(c *Conn) {
 func (p *poller) addConn(c *Conn) error {
 	c.p = p
 	p.g.mux.Lock()
+	if p.g.stopping {
+		p.g.mux.Unlock()
+		_ = c.closeBeforeRegister(errEngineStopping)
+		return errEngineStopping
+	}
 	p.g.connsStd[c] = struct{}{}
+	if c.typ != ConnTypeUDPServer {
+		p.g.wgConn.Add(1)
+	}
 	p.g.mux.Unlock()
 	// should not call onOpen for udp server conn
 	if c.typ != ConnTypeUDPServer {
@@ -82,7 +89,7 @@ func (p *poller) addConn(c *Conn) error {
 		p.g.onUDPListen(c)
 	}
 	// should not read udp client from reading udp server conn
-	if c.typ != ConnTypeUDPClientFromRead {
+	if c.typ != ConnTypeUDPClientFromRead && !c.closed {
 		go p.readConn(c)
 	}
 
@@ -93,7 +100,13 @@ func (p *poller) addConn(c *Conn) error {
 func (p *poller) addDialer(c *Conn) error {
 	c.p = p
 	p.g.mux.Lock()
+	if p.g.stopping {
+		p.g.mux.Unlock()
+		_ = c.closeBeforeRegister(errEngineStopping)
+		return errEngineStopping
+	}
 	p.g.connsStd[c] = struct{}{}
+	p.g.wgConn.Add(1)
 	p.g.mux.Unlock()
 	go p.readConn(c)
 	return nil

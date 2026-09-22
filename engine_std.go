@@ -22,6 +22,10 @@ import (
 //
 //go:norace
 func (g *Engine) Start() error {
+	g.mux.Lock()
+	g.stopping = false
+	g.mux.Unlock()
+
 	// Create listener pollers.
 	udpListeners := make([]*net.UDPConn, len(g.Addrs))[0:0]
 	switch g.Network {
@@ -202,12 +206,9 @@ func (engine *Engine) DialAsyncTimeout(network, addr string, timeout time.Durati
 			onConnected(nil, err)
 			return
 		}
-		engine.wgConn.Add(1)
 		nbc, err = engine.addDialer(nbc)
 		if err == nil {
 			nbc.SetWriteDeadline(time.Time{})
-		} else {
-			engine.wgConn.Done()
 		}
 		onConnected(nbc, err)
 	}()

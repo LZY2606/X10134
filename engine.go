@@ -129,6 +129,11 @@ type Engine struct {
 
 	isOneshot bool
 
+	// stopping is true after Engine.Stop starts closing listeners and
+	// conns, it is used together with mux to make the connection
+	// registration and the stop shutdown mutually exclusive.
+	stopping bool
+
 	wgConn sync.WaitGroup
 
 	// store std connections, for Windows only.
@@ -203,10 +208,12 @@ func (g *Engine) Stop() {
 	}
 
 	g.mux.Lock()
+	g.stopping = true
 	conns := g.connsStd
 	g.connsStd = map[*Conn]struct{}{}
 	connsUnix := g.connsUnix
 	g.mux.Unlock()
+	runHookStopAfterConns()
 
 	g.wgConn.Done()
 	for c := range conns {
@@ -237,6 +244,7 @@ func (g *Engine) Stop() {
 	}
 
 	for i := 0; i < g.NPoller; i++ {
+		runHookPollerStop(i, false)
 		g.pollers[i].stop()
 	}
 
@@ -313,10 +321,7 @@ func (g *Engine) OnOpen(h func(c *Conn)) {
 	if h == nil {
 		panic("invalid handler: nil")
 	}
-	g.onOpen = func(c *Conn) {
-		g.wgConn.Add(1)
-		h(c)
-	}
+	g.onOpen = h
 }
 
 // OnClose registers callback for disconnected.

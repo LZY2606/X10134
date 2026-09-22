@@ -310,6 +310,37 @@ func (c *Conn) CloseWithError(err error) error {
 	return c.Close()
 }
 
+// closeBeforeRegister tears down a conn that has never been published
+// to the engine conn map (rejected while stopping). It must not call
+// poller.deleteConn.
+//
+//go:norace
+func (c *Conn) closeBeforeRegister(err error) error {
+	c.mux.Lock()
+	if c.closeErr == nil {
+		c.closeErr = err
+	}
+	if c.closed {
+		c.mux.Unlock()
+		return nil
+	}
+	c.closed = true
+	if c.rTimer != nil {
+		c.rTimer.Stop()
+		c.rTimer = nil
+	}
+	var closeErr error
+	switch c.typ {
+	case ConnTypeTCP:
+		closeErr = c.conn.Close()
+	case ConnTypeUDPServer, ConnTypeUDPClientFromDial, ConnTypeUDPClientFromRead:
+		closeErr = c.connUDP.Close()
+	default:
+	}
+	c.mux.Unlock()
+	return closeErr
+}
+
 // LocalAddr wraps net.Conn.LocalAddr.
 //
 //go:norace

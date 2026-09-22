@@ -21,4 +21,8 @@ var (
 	ErrDialTimeout = errors.New("dial timeout")
 
 	ErrUnsupported = errors.New("unsupported operation")
+
+	// errEngineStopping is returned when the Engine is stopping and no
+	// longer accepts new connections.
+	errEngineStopping = errors.New("engine is stopping")
 )

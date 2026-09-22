@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-var addr = "127.0.0.1:9999"
+var addr = "127.0.0.1:39999"
 var testfile = "test_tmp.file"
 var engine *Engine
 var testFileSize = 1024 * 1024 * 32
@@ -320,7 +320,7 @@ func TestUDP(t *testing.T) {
 	}
 	defer g.Stop()
 
-	addrstr := fmt.Sprintf("127.0.0.1:%d", 9999)
+	addrstr := fmt.Sprintf("127.0.0.1:%d", 39999)
 	addr, err := net.ResolveUDPAddr("udp", addrstr)
 	if err != nil {
 		t.Fatalf("ResolveUDPAddr error: %v", err)
@@ -335,7 +335,7 @@ func TestUDP(t *testing.T) {
 	newClientConn := func() *net.UDPConn {
 		connUDP, errDial := net.DialUDP("udp4", nil, &net.UDPAddr{
 			IP:   net.IPv4(127, 0, 0, 1),
-			Port: 9999,
+			Port: 39999,
 		})
 		if errDial != nil {
 			t.Fatalf("net.DialUDP failed: %v", err)
@@ -523,11 +523,11 @@ func TestUnix(t *testing.T) {
 		Network: "unix",
 		Addrs:   []string{unixAddr},
 	})
-	var connSvr *Conn
-	var connCli *Conn
+	var connSvr atomic.Value
+	var connCli atomic.Value
 	g.OnOpen(func(c *Conn) {
-		if connSvr == nil {
-			connSvr = c
+		if connSvr.Load() == nil {
+			connSvr.Store(c)
 		}
 		c.Type()
 		c.IsTCP()
@@ -537,13 +537,13 @@ func TestUnix(t *testing.T) {
 	})
 	g.OnData(func(c *Conn, data []byte) {
 		log.Println("unix onData:", c.LocalAddr().String(), c.RemoteAddr().String(), string(data))
-		if c == connSvr {
+		if c == connSvr.Load() {
 			_, err := c.Write([]byte("world"))
 			if err != nil {
 				t.Fatal(err)
 			}
 		}
-		if c == connCli && string(data) == "world" {
+		if c == connCli.Load() && string(data) == "world" {
 			_ = c.Close()
 		}
 	})
@@ -566,11 +566,13 @@ func TestUnix(t *testing.T) {
 	defer func() { _ = c.Close() }()
 	time.Sleep(time.Second / 10)
 	buf := []byte("hello")
-	connCli, err = g.AddConn(c)
+	var connCliC *Conn
+	connCliC, err = g.AddConn(c)
 	if err != nil {
 		t.Fatalf("unix AddConn: %v, %v, %v", c.LocalAddr(), c.RemoteAddr(), err)
 	}
-	_, err = connCli.Write(buf)
+	connCli.Store(connCliC)
+	_, err = connCliC.Write(buf)
 	if err != nil {
 		t.Fatalf("unix Write: %v, %v, %v", c.LocalAddr(), c.RemoteAddr(), err)
 	}

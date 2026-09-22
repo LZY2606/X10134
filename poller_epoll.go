@@ -77,20 +77,35 @@ func (p *poller) addConn(c *Conn) error {
 			fd,
 			len(p.g.connsUnix),
 		)
-		_ = c.closeWithError(err)
+		_ = c.closeBeforeRegister(err)
 		return err
 	}
 	c.p = p
+	p.g.mux.Lock()
+	if p.g.stopping {
+		p.g.mux.Unlock()
+		_ = c.closeBeforeRegister(errEngineStopping)
+		return errEngineStopping
+	}
+	if c.typ != ConnTypeUDPServer && c.typ != ConnTypeUDPClientFromRead {
+		p.g.wgConn.Add(1)
+	}
+	p.g.connsUnix[fd] = c
+	p.g.mux.Unlock()
 	if c.typ != ConnTypeUDPServer {
 		p.g.onOpen(c)
 	} else {
 		p.g.onUDPListen(c)
 	}
-	p.g.connsUnix[fd] = c
-	err := p.addRead(fd)
-	if err != nil {
-		p.g.connsUnix[fd] = nil
-		_ = c.closeWithError(err)
+	var err error
+	if !c.closed {
+		err = p.addRead(fd)
+		if err != nil {
+			p.g.mux.Lock()
+			p.g.connsUnix[fd] = nil
+			p.g.mux.Unlock()
+			_ = c.closeWithError(err)
+		}
 	}
 	return err
 }
@@ -105,15 +120,25 @@ func (p *poller) addDialer(c *Conn) error {
 			fd,
 			len(p.g.connsUnix),
 		)
-		_ = c.closeWithError(err)
+		_ = c.closeBeforeRegister(err)
 		return err
 	}
 	c.p = p
+	p.g.mux.Lock()
+	if p.g.stopping {
+		p.g.mux.Unlock()
+		_ = c.closeBeforeRegister(errEngineStopping)
+		return errEngineStopping
+	}
+	p.g.wgConn.Add(1)
 	p.g.connsUnix[fd] = c
 	c.isWAdded = true
+	p.g.mux.Unlock()
 	err := p.addReadWrite(fd)
 	if err != nil {
+		p.g.mux.Lock()
 		p.g.connsUnix[fd] = nil
+		p.g.mux.Unlock()
 		_ = c.closeWithError(err)
 	}
 	return err
@@ -132,9 +157,11 @@ func (p *poller) deleteConn(c *Conn) {
 	fd := c.fd
 
 	if c.typ != ConnTypeUDPClientFromRead {
+		p.g.mux.Lock()
 		if c == p.g.connsUnix[fd] {
 			p.g.connsUnix[fd] = nil
 		}
+		p.g.mux.Unlock()
 		// p.deleteEvent(fd)
 	}
 
@@ -172,6 +199,7 @@ func (p *poller) acceptorLoop() {
 	for !p.shutdown {
 		conn, err := p.listener.Accept()
 		if err == nil {
+			runHookAfterAccept(conn)
 			var c *Conn
 			c, err = NBConn(conn)
 			if err != nil {

@@ -325,12 +325,12 @@ func (c *Conn) readUDP(b []byte) (*Conn, int, error) {
 	if c.typ == ConnTypeUDPServer {
 		// get or create and cache the consistent connection for the socket
 		// that has the same local addr and remote addr.
-		uc, ok := c.connUDP.getConn(c.p, c.fd, rAddr)
+		uc, _ := c.connUDP.getConn(c.p, c.fd, rAddr, g)
+		if uc == nil {
+			return c, 0, syscall.EAGAIN
+		}
 		if g.UDPReadTimeout > 0 {
 			_ = uc.SetReadDeadline(time.Now().Add(g.UDPReadTimeout))
-		}
-		if !ok {
-			g.onOpen(uc)
 		}
 		dstConn = uc
 	}
@@ -1025,6 +1025,44 @@ func (c *Conn) closeWithErrorWithoutLock(err error) error {
 	return err
 }
 
+// closeBeforeRegister tears down a conn that has never been published
+// to the poller conn table (rejected while stopping, fd limit or poller
+// registration failure). It must not call poller.deleteConn.
+//
+//go:norace
+func (c *Conn) closeBeforeRegister(err error) error {
+	c.mux.Lock()
+	c.closed = true
+	c.closeErr = err
+	if c.wTimer != nil {
+		c.wTimer.Stop()
+		c.wTimer = nil
+	}
+	if c.rTimer != nil {
+		c.rTimer.Stop()
+		c.rTimer = nil
+	}
+	var u *udpConn
+	if c.typ == ConnTypeUDPClientFromRead {
+		u = c.connUDP
+	}
+	c.mux.Unlock()
+	if u != nil && u.parent != nil {
+		u.parent.mux.Lock()
+		delete(u.parent.connUDP.conns, u.rAddrKey)
+		u.parent.mux.Unlock()
+		return nil
+	}
+	switch c.typ {
+	case ConnTypeTCP, ConnTypeUnix:
+		return syscall.Close(c.fd)
+	case ConnTypeUDPServer, ConnTypeUDPClientFromDial:
+		return c.connUDP.Close()
+	default:
+		return nil
+	}
+}
+
 // NBConn converts net.Conn to *Conn.
 //
 //go:norace
@@ -1075,34 +1113,44 @@ func (u *udpConn) Close() error {
 }
 
 //go:norace
-func (u *udpConn) getConn(p *poller, fd int, rsa syscall.Sockaddr) (*Conn, bool) {
+func (u *udpConn) getConn(p *poller, fd int, rsa syscall.Sockaddr, g *Engine) (*Conn, bool) {
 	rAddrKey := getUDPNetAddrKey(rsa)
 	u.mux.RLock()
 	c, ok := u.conns[rAddrKey]
 	u.mux.RUnlock()
 
-	// new connection, create it.
-	if !ok {
-		c = &Conn{
-			p:     p,
-			fd:    fd,
-			lAddr: u.parent.lAddr,
-			rAddr: getUDPNetAddr(rsa),
-			typ:   ConnTypeUDPClientFromRead,
-			connUDP: &udpConn{
-				rAddr:    rsa,
-				rAddrKey: rAddrKey,
-				parent:   u.parent,
-			},
-		}
-
-		// storage the consistent connection for the same remote addr.
-		u.mux.Lock()
-		u.conns[rAddrKey] = c
-		u.mux.Unlock()
+	// existing consistent connection for the same remote addr.
+	if ok {
+		return c, false
 	}
 
-	return c, ok
+	newConn := &Conn{
+		p:     p,
+		fd:    fd,
+		lAddr: u.parent.lAddr,
+		rAddr: getUDPNetAddr(rsa),
+		typ:   ConnTypeUDPClientFromRead,
+		connUDP: &udpConn{
+			rAddr:    rsa,
+			rAddrKey: rAddrKey,
+			parent:   u.parent,
+		},
+	}
+
+	g.mux.Lock()
+	if g.stopping {
+		g.mux.Unlock()
+		// drop this packet: the udp server is already in the closing
+		// sequence, no more child conn may be registered.
+		return nil, false
+	}
+	g.wgConn.Add(1)
+	u.mux.Lock()
+	u.conns[rAddrKey] = newConn
+	u.mux.Unlock()
+	g.mux.Unlock()
+	g.onOpen(newConn)
+	return newConn, true
 }
 
 type udpAddrKey [22]byte
