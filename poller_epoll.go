@@ -91,8 +91,17 @@ func (p *poller) addConn(c *Conn) error {
 	if err != nil {
 		p.g.connsUnix[fd] = nil
 		_ = c.closeWithError(err)
+		return err
 	}
-	return err
+	p.g.mux.Lock()
+	stopping := p.g.stopped
+	p.g.mux.Unlock()
+	if stopping && c.typ != ConnTypeUDPServer {
+		// The engine is stopping: wgConn for this conn has already been
+		// accounted for, close it so Stop's wgConn.Wait can reach zero.
+		_ = c.closeWithError(net.ErrClosed)
+	}
+	return nil
 }
 
 // add the connection to poller and handle its io events.
@@ -115,8 +124,16 @@ func (p *poller) addDialer(c *Conn) error {
 	if err != nil {
 		p.g.connsUnix[fd] = nil
 		_ = c.closeWithError(err)
+		return err
 	}
-	return err
+	p.g.mux.Lock()
+	stopping := p.g.stopped
+	p.g.mux.Unlock()
+	if stopping {
+		_ = c.closeWithError(net.ErrClosed)
+		return nil
+	}
+	return nil
 }
 
 //go:norace

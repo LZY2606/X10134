@@ -78,6 +78,18 @@ func (p *poller) addConn(c *Conn) error {
 		p.g.onUDPListen(c)
 	}
 	p.g.connsUnix[fd] = c
+	p.g.mux.Lock()
+	stopping := p.g.stopped
+	p.g.mux.Unlock()
+	if stopping {
+		if c.typ != ConnTypeUDPServer {
+			// The engine is stopping: wgConn for this conn has already
+			// been accounted for, close it so Stop's wgConn.Wait can
+			// reach zero.
+			_ = c.closeWithError(net.ErrClosed)
+			return nil
+		}
+	}
 	p.addRead(fd)
 	return nil
 }
@@ -96,6 +108,13 @@ func (p *poller) addDialer(c *Conn) error {
 	c.p = p
 	p.g.connsUnix[fd] = c
 	c.isWAdded = true
+	p.g.mux.Lock()
+	stopping := p.g.stopped
+	p.g.mux.Unlock()
+	if stopping {
+		_ = c.closeWithError(net.ErrClosed)
+		return nil
+	}
 	p.addReadWrite(fd)
 	return nil
 }

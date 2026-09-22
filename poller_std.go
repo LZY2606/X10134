@@ -73,8 +73,13 @@ func (p *poller) readConn(c *Conn) {
 func (p *poller) addConn(c *Conn) error {
 	c.p = p
 	p.g.mux.Lock()
+	stopping := p.g.stopped
 	p.g.connsStd[c] = struct{}{}
 	p.g.mux.Unlock()
+	if stopping {
+		_ = c.CloseWithError(net.ErrClosed)
+		return nil
+	}
 	// should not call onOpen for udp server conn
 	if c.typ != ConnTypeUDPServer {
 		p.g.onOpen(c)
@@ -93,8 +98,13 @@ func (p *poller) addConn(c *Conn) error {
 func (p *poller) addDialer(c *Conn) error {
 	c.p = p
 	p.g.mux.Lock()
+	stopping := p.g.stopped
 	p.g.connsStd[c] = struct{}{}
 	p.g.mux.Unlock()
+	if stopping {
+		_ = c.CloseWithError(net.ErrClosed)
+		return nil
+	}
 	go p.readConn(c)
 	return nil
 }

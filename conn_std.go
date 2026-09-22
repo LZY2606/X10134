@@ -164,6 +164,9 @@ func (c *Conn) readUDP(b []byte) (int, error) {
 //
 //go:norace
 func (c *Conn) Write(b []byte) (int, error) {
+	if testHookConnWriteEnter != nil {
+		testHookConnWriteEnter(c)
+	}
 	var n int
 	var err error
 	switch c.typ {
@@ -185,6 +188,12 @@ func (c *Conn) Write(b []byte) (int, error) {
 //go:norace
 func (c *Conn) writeTCP(b []byte) (int, error) {
 	// c.p.g.beforeWrite(c)
+	c.mux.Lock()
+	if c.closed {
+		c.mux.Unlock()
+		return 0, net.ErrClosed
+	}
+	c.mux.Unlock()
 	nwrite, err := c.conn.Write(b)
 	if err != nil {
 		if c.closeErr == nil {
@@ -224,6 +233,9 @@ func (c *Conn) writeUDPClientFromRead(b []byte) (int, error) {
 //
 //go:norace
 func (c *Conn) Writev(in [][]byte) (int, error) {
+	if testHookConnWriteEnter != nil {
+		testHookConnWriteEnter(c)
+	}
 	if c.connUDP == nil {
 		buffers := net.Buffers(in)
 		nwrite, err := buffers.WriteTo(c.conn)

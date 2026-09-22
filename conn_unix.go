@@ -348,6 +348,10 @@ func (c *Conn) readUDP(b []byte) (*Conn, int, error) {
 func (c *Conn) Write(b []byte) (int, error) {
 	// c.p.g.beforeWrite(c)
 
+	if testHookConnWriteEnter != nil {
+		testHookConnWriteEnter(c)
+	}
+
 	c.mux.Lock()
 	if c.closed {
 		c.mux.Unlock()
@@ -385,6 +389,10 @@ func (c *Conn) Write(b []byte) (int, error) {
 //go:norace
 func (c *Conn) Writev(in [][]byte) (int, error) {
 	// c.p.g.beforeWrite(c)
+
+	if testHookConnWriteEnter != nil {
+		testHookConnWriteEnter(c)
+	}
 
 	c.mux.Lock()
 	if c.closed {
@@ -800,6 +808,9 @@ func (c *Conn) flush() error {
 
 	if len(c.writeList) == 0 {
 		return nil
+	}
+	if testHookFlushQueued != nil {
+		testHookFlushQueued(c)
 	}
 
 	onWrittenSize := c.p.g.onWrittenSize

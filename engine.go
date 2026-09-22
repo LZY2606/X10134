@@ -128,6 +128,7 @@ type Engine struct {
 	mux     sync.Mutex
 
 	isOneshot bool
+	stopped   bool
 
 	wgConn sync.WaitGroup
 
@@ -198,8 +199,15 @@ func (e *Engine) SetLTSyncRead() {
 //
 //go:norace
 func (g *Engine) Stop() {
+	g.mux.Lock()
+	g.stopped = true
+	g.mux.Unlock()
+
 	for _, l := range g.listeners {
 		l.stop()
+	}
+	if testHookStopListenersDone != nil {
+		testHookStopListenersDone()
 	}
 
 	g.mux.Lock()
