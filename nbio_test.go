@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-var addr = "127.0.0.1:9999"
+var addr = "127.0.0.1:39999"
 var testfile = "test_tmp.file"
 var engine *Engine
 var testFileSize = 1024 * 1024 * 32

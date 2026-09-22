@@ -86,6 +86,7 @@ func (p *poller) addConn(c *Conn) error {
 		go p.readConn(c)
 	}
 
+	testHookConnRegistered(c)
 	return nil
 }
 
@@ -124,6 +125,7 @@ func (p *poller) start() {
 	if p.isListener {
 		var err error
 		p.shutdown = false
+		defer p.g.wgListener.Done()
 		for !p.shutdown {
 			err = p.accept()
 			if err != nil {

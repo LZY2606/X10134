@@ -129,6 +129,11 @@ type Engine struct {
 
 	isOneshot bool
 
+	// wgListener tracks running listener goroutines. Stop waits for them to
+	// exit before snapshotting the connection maps, so that every connection
+	// the listener hands to a poller during shutdown is closed exactly once.
+	wgListener sync.WaitGroup
+
 	wgConn sync.WaitGroup
 
 	// store std connections, for Windows only.
@@ -202,11 +207,23 @@ func (g *Engine) Stop() {
 		l.stop()
 	}
 
+	// Test-only synchronization points, no-ops in production builds'
+	// runtime behavior (the hooks default to no-op functions).
+	testHookStopAcceptorsJoined()
+
+	// Wait until every listener goroutine has left its accept loop. Any
+	// connection accepted before the listeners were stopped has already been
+	// added to a poller (and counted in wgConn); anything accepted after this
+	// point is impossible because the listeners are closed and their loops
+	// have exited.
+	g.wgListener.Wait()
+
 	g.mux.Lock()
 	conns := g.connsStd
 	g.connsStd = map[*Conn]struct{}{}
 	connsUnix := g.connsUnix
 	g.mux.Unlock()
+	testHookStopConnsSnapshot(connsUnix)
 
 	g.wgConn.Done()
 	for c := range conns {

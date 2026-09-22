@@ -77,8 +77,17 @@ func (p *poller) addConn(c *Conn) error {
 	} else {
 		p.g.onUDPListen(c)
 	}
+	// The connection may have been closed while onOpen was running (onOpen
+	// is invoked synchronously and users are allowed to block inside it).
+	// In that case the close path has already released the fd and published
+	// the close event; do not publish a second one by registering it, just
+	// report the failure to the caller.
+	if c.closed {
+		return net.ErrClosed
+	}
 	p.g.connsUnix[fd] = c
 	p.addRead(fd)
+	testHookConnRegistered(c)
 	return nil
 }
 
@@ -261,6 +270,7 @@ func (p *poller) acceptorLoop() {
 		defer runtime.UnlockOSThread()
 	}
 
+	defer p.g.wgListener.Done()
 	p.shutdown = false
 	for !p.shutdown {
 		conn, err := p.listener.Accept()

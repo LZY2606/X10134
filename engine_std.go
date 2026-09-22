@@ -82,6 +82,7 @@ func (g *Engine) Start() error {
 
 	// Start TCP/Unix listener pollers.
 	for _, l := range g.listeners {
+		g.wgListener.Add(1)
 		g.Add(1)
 		go l.start()
 	}
