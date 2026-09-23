@@ -73,12 +73,14 @@ func (p *poller) addConn(c *Conn) error {
 	}
 	c.p = p
 	if c.typ != ConnTypeUDPServer {
+		p.g.hookBeforeOnOpen(c)
 		p.g.onOpen(c)
 	} else {
 		p.g.onUDPListen(c)
 	}
 	p.g.connsUnix[fd] = c
 	p.addRead(fd)
+	p.g.hookConnAdded(c)
 	return nil
 }
 

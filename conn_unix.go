@@ -349,6 +349,11 @@ func (c *Conn) Write(b []byte) (int, error) {
 	// c.p.g.beforeWrite(c)
 
 	c.mux.Lock()
+	if c.p != nil {
+		if h := c.p.g.testHooks; h != nil && h.inWrite != nil {
+			h.inWrite(c)
+		}
+	}
 	if c.closed {
 		c.mux.Unlock()
 		return -1, net.ErrClosed
@@ -979,6 +984,11 @@ func (c *Conn) overflow(n int) bool {
 
 //go:norace
 func (c *Conn) closeWithError(err error) error {
+	if c.p != nil {
+		if h := c.p.g.testHooks; h != nil && h.closing != nil {
+			h.closing(c)
+		}
+	}
 	c.mux.Lock()
 	if !c.closed {
 		c.closed = true

@@ -129,6 +129,10 @@ type Engine struct {
 
 	isOneshot bool
 
+	// testHooks is nil in production; lifecycle tests install deterministic
+	// rendezvous points through it.
+	testHooks *testHooks
+
 	wgConn sync.WaitGroup
 
 	// store std connections, for Windows only.
@@ -201,6 +205,7 @@ func (g *Engine) Stop() {
 	for _, l := range g.listeners {
 		l.stop()
 	}
+	g.hookStopAfterListeners()
 
 	g.mux.Lock()
 	conns := g.connsStd

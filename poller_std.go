@@ -77,6 +77,7 @@ func (p *poller) addConn(c *Conn) error {
 	p.g.mux.Unlock()
 	// should not call onOpen for udp server conn
 	if c.typ != ConnTypeUDPServer {
+		p.g.hookBeforeOnOpen(c)
 		p.g.onOpen(c)
 	} else {
 		p.g.onUDPListen(c)
@@ -85,6 +86,7 @@ func (p *poller) addConn(c *Conn) error {
 	if c.typ != ConnTypeUDPClientFromRead {
 		go p.readConn(c)
 	}
+	p.g.hookConnAdded(c)
 
 	return nil
 }
