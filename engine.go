@@ -170,6 +170,17 @@ type Engine struct {
 	onStop func()
 
 	ioTaskPool *taskpool.IOTaskPool
+
+	// wgAccept tracks accepted connections whose addConn work has not
+	// finished. Stop waits for them so that an accept that completed just
+	// before listener.Close does not race with poller shutdown.
+	wgAccept sync.WaitGroup
+
+	// Test-only synchronization hooks. They are unexported, installed
+	// before Start and nil by default, so they expose no public API and
+	// add no overhead outside tests.
+	testHookAccepted func(c *Conn)
+	testHookBeforeWrite func(c *Conn)
 }
 
 // SetETAsyncRead .
@@ -201,6 +212,11 @@ func (g *Engine) Stop() {
 	for _, l := range g.listeners {
 		l.stop()
 	}
+
+	// Wait for accepts that returned before the listeners were closed to
+	// finish adding their conn (and invoke onOpen) before we snapshot the
+	// conn set and shut the pollers down.
+	g.wgAccept.Wait()
 
 	g.mux.Lock()
 	conns := g.connsStd

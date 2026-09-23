@@ -81,18 +81,26 @@ func (p *poller) addConn(c *Conn) error {
 		return err
 	}
 	c.p = p
+	p.g.connsUnix[fd] = c
 	if c.typ != ConnTypeUDPServer {
 		p.g.onOpen(c)
 	} else {
 		p.g.onUDPListen(c)
 	}
-	p.g.connsUnix[fd] = c
 	err := p.addRead(fd)
 	if err != nil {
 		p.g.connsUnix[fd] = nil
 		_ = c.closeWithError(err)
+		return err
 	}
-	return err
+	if c.closed {
+		// Closed during onOpen: closeWithError already published the
+		// close event and cleared the slot; do not keep a stale conn.
+		if c == p.g.connsUnix[fd] {
+			p.g.connsUnix[fd] = nil
+		}
+	}
+	return nil
 }
 
 // add the connection to poller and handle its io events.

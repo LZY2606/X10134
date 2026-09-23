@@ -72,12 +72,22 @@ func (p *poller) addConn(c *Conn) error {
 		return err
 	}
 	c.p = p
+	p.g.connsUnix[fd] = c
 	if c.typ != ConnTypeUDPServer {
 		p.g.onOpen(c)
 	} else {
 		p.g.onUDPListen(c)
 	}
-	p.g.connsUnix[fd] = c
+	if c.closed {
+		// The conn was closed while onOpen was running. addRead below
+		// would register an event for a closed fd whose fd number may
+		// already be reused, and closeWithError already released the
+		// slot (or it never owned it); leave no stale conn behind.
+		if c == p.g.connsUnix[fd] {
+			p.g.connsUnix[fd] = nil
+		}
+		return nil
+	}
 	p.addRead(fd)
 	return nil
 }
@@ -271,7 +281,14 @@ func (p *poller) acceptorLoop() {
 				_ = conn.Close()
 				continue
 			}
-			_ = p.g.pollers[c.Hash()%len(p.g.pollers)].addConn(c)
+			p.g.wgAccept.Add(1)
+			if p.g.testHookAccepted != nil {
+				p.g.testHookAccepted(c)
+			}
+			func() {
+				defer p.g.wgAccept.Done()
+				_ = p.g.pollers[c.Hash()%len(p.g.pollers)].addConn(c)
+			}()
 		} else {
 			var ne net.Error
 			if ok := errors.As(err, &ne); ok && ne.Timeout() {
