@@ -202,11 +202,19 @@ func (g *Engine) Stop() {
 		l.stop()
 	}
 
+	if testHookAfterListenersStopped != nil {
+		testHookAfterListenersStopped()
+	}
+
 	g.mux.Lock()
 	conns := g.connsStd
 	g.connsStd = map[*Conn]struct{}{}
 	connsUnix := g.connsUnix
 	g.mux.Unlock()
+
+	if testHookAfterConnsSnapshot != nil {
+		testHookAfterConnsSnapshot()
+	}
 
 	g.wgConn.Done()
 	for c := range conns {
