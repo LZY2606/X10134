@@ -47,6 +47,12 @@ const (
 var (
 	// MaxOpenFiles .
 	MaxOpenFiles = 1024 * 1024 * 2
+
+	// testHookAfterConnWait, when non-nil, is invoked by Engine.Stop right
+	// after it has closed and waited for all the connections that were
+	// known when Stop began. It is only set by tests to build deterministic
+	// lifecycle interleavings and is not part of the public API.
+	testHookAfterConnWait func()
 )
 
 // Config Of Engine.
@@ -227,6 +233,10 @@ func (g *Engine) Stop() {
 	}
 
 	g.wgConn.Wait()
+
+	if testHookAfterConnWait != nil {
+		testHookAfterConnWait()
+	}
 
 	g.onStop()
 
