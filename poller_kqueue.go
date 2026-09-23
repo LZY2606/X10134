@@ -271,7 +271,13 @@ func (p *poller) acceptorLoop() {
 				_ = conn.Close()
 				continue
 			}
+			if testAcceptBeforeAddConnHook != nil {
+				testAcceptBeforeAddConnHook()
+			}
 			_ = p.g.pollers[c.Hash()%len(p.g.pollers)].addConn(c)
+			if testAcceptAfterAddConnHook != nil {
+				testAcceptAfterAddConnHook()
+			}
 		} else {
 			var ne net.Error
 			if ok := errors.As(err, &ne); ok && ne.Timeout() {
