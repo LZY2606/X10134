@@ -49,6 +49,13 @@ var (
 	MaxOpenFiles = 1024 * 1024 * 2
 )
 
+// testHookAfterConnSweep, when non-nil, is called by Stop right after the
+// close jobs for all known connections have been dispatched and before
+// Stop waits for the connection callbacks to finish. It is nil in
+// production and is only set by tests in this package to synchronize
+// lifecycle interleavings deterministically. It is not a public API.
+var testHookAfterConnSweep func()
+
 // Config Of Engine.
 type Config struct {
 	// Name describes your gopher name for logging, it's set to "NB" by default.
@@ -224,6 +231,10 @@ func (g *Engine) Stop() {
 				_ = cc.Close()
 			})
 		}
+	}
+
+	if testHookAfterConnSweep != nil {
+		testHookAfterConnSweep()
 	}
 
 	g.wgConn.Wait()
