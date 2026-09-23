@@ -48,6 +48,9 @@ func (p *poller) accept() error {
 	if err != nil {
 		return err
 	}
+	if testHookAfterAccept != nil {
+		testHookAfterAccept()
+	}
 
 	c := newConn(conn)
 	o := p.g.pollers[c.Hash()%len(p.g.pollers)]
@@ -73,13 +76,20 @@ func (p *poller) readConn(c *Conn) {
 func (p *poller) addConn(c *Conn) error {
 	c.p = p
 	p.g.mux.Lock()
-	p.g.connsStd[c] = struct{}{}
+	stopped := p.g.stopped
+	if !stopped {
+		p.g.connsStd[c] = struct{}{}
+	}
 	p.g.mux.Unlock()
 	// should not call onOpen for udp server conn
 	if c.typ != ConnTypeUDPServer {
 		p.g.onOpen(c)
 	} else {
 		p.g.onUDPListen(c)
+	}
+	if stopped {
+		_ = c.CloseWithError(errEngineStopped)
+		return errEngineStopped
 	}
 	// should not read udp client from reading udp server conn
 	if c.typ != ConnTypeUDPClientFromRead {

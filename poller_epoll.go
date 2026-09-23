@@ -86,7 +86,14 @@ func (p *poller) addConn(c *Conn) error {
 	} else {
 		p.g.onUDPListen(c)
 	}
+	p.g.mux.Lock()
+	if p.g.stopped {
+		p.g.mux.Unlock()
+		_ = c.closeWithError(errEngineStopped)
+		return errEngineStopped
+	}
 	p.g.connsUnix[fd] = c
+	p.g.mux.Unlock()
 	err := p.addRead(fd)
 	if err != nil {
 		p.g.connsUnix[fd] = nil
@@ -172,6 +179,9 @@ func (p *poller) acceptorLoop() {
 	for !p.shutdown {
 		conn, err := p.listener.Accept()
 		if err == nil {
+			if testHookAfterAccept != nil {
+				testHookAfterAccept()
+			}
 			var c *Conn
 			c, err = NBConn(conn)
 			if err != nil {
