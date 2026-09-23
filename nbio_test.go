@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-var addr = "127.0.0.1:9999"
+var addr = "127.0.0.1:0"
 var testfile = "test_tmp.file"
 var engine *Engine
 var testFileSize = 1024 * 1024 * 32
@@ -98,6 +98,7 @@ func init() {
 	if err != nil {
 		log.Panicf("Start failed: %v\n", err)
 	}
+	addr = g.Addrs[0]
 
 	engine = g
 }
