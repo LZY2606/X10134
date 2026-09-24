@@ -178,7 +178,13 @@ func (p *poller) acceptorLoop() {
 				_ = conn.Close()
 				continue
 			}
+			if h := testHooks.afterAccept; h != nil {
+				h()
+			}
 			err = p.g.pollers[c.Hash()%len(p.g.pollers)].addConn(c)
+			if h := testHooks.afterAddConn; h != nil {
+				h()
+			}
 			if err != nil {
 				logging.Error("NBIO[%v][%v_%v] addConn [fd: %v] failed: %v",
 					p.g.Name,

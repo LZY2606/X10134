@@ -13,7 +13,9 @@ import (
 	"time"
 )
 
-var addr = "127.0.0.1:9999"
+// addr is assigned dynamically in init so the test suite never depends on
+// a fixed port being free on the host.
+var addr string
 var testfile = "test_tmp.file"
 var engine *Engine
 var testFileSize = 1024 * 1024 * 32
@@ -25,7 +27,7 @@ func init() {
 		log.Panicf("write file failed: %v", err)
 	}
 
-	addrs := []string{addr}
+	addrs := []string{"127.0.0.1:0"}
 	g := NewEngine(Config{
 		Network: "tcp",
 		Addrs:   addrs,
@@ -99,6 +101,7 @@ func init() {
 		log.Panicf("Start failed: %v\n", err)
 	}
 
+	addr = g.Addrs[0]
 	engine = g
 }
 
@@ -320,7 +323,7 @@ func TestUDP(t *testing.T) {
 	}
 	defer g.Stop()
 
-	addrstr := fmt.Sprintf("127.0.0.1:%d", 9999)
+	addrstr := "127.0.0.1:0"
 	addr, err := net.ResolveUDPAddr("udp", addrstr)
 	if err != nil {
 		t.Fatalf("ResolveUDPAddr error: %v", err)
@@ -329,13 +332,14 @@ func TestUDP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen error: %v", err)
 	}
+	udpPort := conn.LocalAddr().(*net.UDPAddr).Port
 
 	lisConn, _ := g.AddConn(conn)
 
 	newClientConn := func() *net.UDPConn {
 		connUDP, errDial := net.DialUDP("udp4", nil, &net.UDPAddr{
 			IP:   net.IPv4(127, 0, 0, 1),
-			Port: 9999,
+			Port: udpPort,
 		})
 		if errDial != nil {
 			t.Fatalf("net.DialUDP failed: %v", err)
@@ -437,13 +441,13 @@ func TestUDP(t *testing.T) {
 
 func TestDialAsyncTCP(t *testing.T) {
 	network := "tcp"
-	addr := "127.0.0.1:10001"
+	addr := "127.0.0.1:0"
 	testDialAsync(t, network, addr)
 }
 
 func TestDialAsyncUDP(t *testing.T) {
 	network := "udp"
-	addr := "127.0.0.1:10001"
+	addr := "127.0.0.1:0"
 	testDialAsync(t, network, addr)
 }
 
@@ -452,7 +456,8 @@ func TestDialAsyncUnix(t *testing.T) {
 		return
 	}
 	network := "unix"
-	addr := "unix.server"
+	addr := fmt.Sprintf("nbio-test-%d.unix", os.Getpid())
+	defer func() { _ = os.Remove(addr) }()
 	testDialAsync(t, network, addr)
 }
 
@@ -487,6 +492,10 @@ func testDialAsync(t *testing.T, network, addr string) {
 	}
 	defer engineAsync.Stop()
 
+	// The engine may have listened on a dynamic port; dial the address
+	// it actually bound.
+	dialAddr := engineAsync.Addrs[0]
+
 	onConnected := func(c *Conn, err error) {
 		log.Printf("TestTestDialAsync[%v, %v] OnConnected: %v, %v, %v", network, addr, c.LocalAddr().String(), c.RemoteAddr().String(), err)
 		if err == nil {
@@ -502,7 +511,7 @@ func testDialAsync(t *testing.T, network, addr string) {
 	}
 
 	time.Sleep(time.Second / 10)
-	err = engineAsync.DialAsyncTimeout(network, addr, time.Second*10, onConnected)
+	err = engineAsync.DialAsyncTimeout(network, dialAddr, time.Second*10, onConnected)
 	if err != nil {
 		t.Fatalf("TestTestDialAsync[%v, %v] DialAsyncTimeout failed: %v", network, addr, err)
 	}
@@ -525,10 +534,13 @@ func TestUnix(t *testing.T) {
 	})
 	var connSvr *Conn
 	var connCli *Conn
+	var connMux sync.RWMutex
 	g.OnOpen(func(c *Conn) {
+		connMux.Lock()
 		if connSvr == nil {
 			connSvr = c
 		}
+		connMux.Unlock()
 		c.Type()
 		c.IsTCP()
 		c.IsUDP()
@@ -537,13 +549,17 @@ func TestUnix(t *testing.T) {
 	})
 	g.OnData(func(c *Conn, data []byte) {
 		log.Println("unix onData:", c.LocalAddr().String(), c.RemoteAddr().String(), string(data))
-		if c == connSvr {
+		connMux.RLock()
+		isSvr := c == connSvr
+		isCli := c == connCli
+		connMux.RUnlock()
+		if isSvr {
 			_, err := c.Write([]byte("world"))
 			if err != nil {
 				t.Fatal(err)
 			}
 		}
-		if c == connCli && string(data) == "world" {
+		if isCli && string(data) == "world" {
 			_ = c.Close()
 		}
 	})
@@ -566,7 +582,10 @@ func TestUnix(t *testing.T) {
 	defer func() { _ = c.Close() }()
 	time.Sleep(time.Second / 10)
 	buf := []byte("hello")
-	connCli, err = g.AddConn(c)
+	cc, err := g.AddConn(c)
+	connMux.Lock()
+	connCli = cc
+	connMux.Unlock()
 	if err != nil {
 		t.Fatalf("unix AddConn: %v, %v, %v", c.LocalAddr(), c.RemoteAddr(), err)
 	}

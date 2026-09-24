@@ -202,6 +202,10 @@ func (g *Engine) Stop() {
 		l.stop()
 	}
 
+	if h := testHooks.stopBeforeConnSweep; h != nil {
+		h()
+	}
+
 	g.mux.Lock()
 	conns := g.connsStd
 	g.connsStd = map[*Conn]struct{}{}
